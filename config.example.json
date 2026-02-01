@@ -1,0 +1,55 @@
+{
+  "discord_webhook_url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN",
+  
+  "keywords": [
+    "RTX 4070",
+    "2TB NVMe",
+    "AM5",
+    "DDR5"
+  ],
+  
+  "filters": {
+    "max_price": 500,
+    "min_discount_percent": 15
+  },
+  
+  "sources": [
+    {
+      "type": "reddit",
+      "name": "Reddit r/buildapcsales",
+      "subreddit": "buildapcsales"
+    }
+  ],
+
+  "discord_control": {
+    "enabled": false,
+    "channel_id": "YOUR_CHANNEL_ID",
+    "token_env": "DISCORD_BOT_TOKEN",
+    "allowed_user_ids": [
+      "YOUR_USER_ID"
+    ],
+    "ack": true
+  },
+  
+  "_comments": {
+    "discord_webhook_url": "Get this from Discord: Server Settings > Integrations > Webhooks > New Webhook",
+    "keywords": "Add all terms you want to monitor. Case-insensitive matching.",
+    "filters": {
+      "max_price": "Set a number to only get deals under that price (or null for no limit)",
+      "min_discount_percent": "Minimum discount percentage to notify (or null for no minimum)"
+    },
+    "discord_control": {
+      "enabled": "Set true to allow receiving commands from a Discord bot in a control channel (webhooks cannot receive messages)",
+      "channel_id": "Discord channel ID to read commands from",
+      "token_env": "Environment variable name that stores your bot token (recommended)",
+      "allowed_user_ids": "Optional allowlist of Discord user IDs. Empty = allow anyone in that channel.",
+      "ack": "If true, bot posts a short acknowledgement message back to the control channel"
+    },
+    "sources": "Add RSS feeds or JSON endpoints. Types: 'rss' or 'json'",
+    "example_json_source": {
+      "type": "json",
+      "name": "Custom API",
+      "url": "https://api.example.com/deals"
+    }
+  }
+}

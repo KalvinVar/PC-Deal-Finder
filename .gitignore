@@ -1,0 +1,23 @@
+# Secrets and sensitive data
+config.json
+*.env
+.env
+
+# Runtime state
+control_state.json
+history.json
+keywords.txt
+
+# Logs
+logs/*.log
+
+# .NET build outputs
+control-bot/bin/
+control-bot/obj/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# VS Code
+.vscode/
