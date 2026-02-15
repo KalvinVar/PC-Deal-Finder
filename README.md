@@ -1,15 +1,19 @@
 # Deal Monitor - Automated Deal Alerts via Discord
 
-A PowerShell-based deal monitoring system that tracks RSS feeds and deal sources, filters by keywords and criteria, scores deals by "hotness", and sends notifications to Discord.
+A PowerShell-based deal monitoring system that tracks Reddit and other deal sources, filters by keywords and criteria, scores deals by "hotness", and sends notifications to Discord. Includes a C# Discord bot for instant remote control.
 
 ## Features
 
-✅ **Multi-Source Support** - Monitor multiple RSS feeds and JSON endpoints  
-✅ **Smart Filtering** - Filter by keywords, max price, and minimum discount percentage  
+✅ **Multi-Source Support** - Monitor multiple subreddits, RSS feeds, and JSON endpoints  
+✅ **Multi-Watch System** - Create independent search groups (e.g., GPUs under $1200 AND monitors under $200) each with their own keywords and filters  
+✅ **Smart Filtering** - Filter by keywords, max price, minimum discount %, and Reddit flairs  
 ✅ **Hotness Scoring** - Automatically scores deals based on discount %, price threshold, and keyword relevance  
 ✅ **Discord Notifications** - Rich embedded notifications with color-coded urgency  
-✅ **Duplicate Prevention** - Tracks sent deals to avoid repeat notifications  
-✅ **Comprehensive Logging** - Daily log files for troubleshooting  
+✅ **Discord Bot Control** - Always-on C# bot for instant command responses (`!scan`, `!watch`, `!clearhistory`, etc.)  
+✅ **On-Demand Scanning** - Type `!scan` in Discord to run the monitor immediately  
+✅ **Duplicate Prevention** - Tracks sent deals with crash-safe per-send history saves  
+✅ **Rate Limit Handling** - Automatic retry with Discord 429 rate limits  
+✅ **Log Rotation** - Daily log files with auto-cleanup of logs older than 30 days  
 ✅ **Task Scheduler Ready** - Designed for automated Windows Task Scheduler execution  
 
 ## Quick Start
@@ -18,350 +22,288 @@ A PowerShell-based deal monitoring system that tracks RSS feeds and deal sources
 
 - **Windows 10/11** with PowerShell 5.1+
 - **Discord Webhook URL** (see setup below)
-- **Internet connection** for fetching deals
+- **.NET 8 SDK** (optional, for the Discord control bot)
 
 ### 2. Get Your Discord Webhook URL
 
-1. Open Discord and go to your server
-2. Right-click the channel where you want notifications → **Edit Channel**
-3. Go to **Integrations** → **Webhooks** → **New Webhook**
-4. Click **Copy Webhook URL**
-5. Save this URL for the next step
+1. Open Discord → your server
+2. Right-click the channel → **Edit Channel** → **Integrations** → **Webhooks** → **New Webhook**
+3. Click **Copy Webhook URL**
 
-### 3. Configure the Script
+### 3. Configure
 
-Easiest option (no JSON editing): update `keywords.txt` (one keyword per line).
+Copy `config.example.json` to `config.json` and fill in your webhook URL.
+
+**Simple mode** — edit `keywords.txt` (one keyword per line):
 
 ```text
-750W
-power supply
-PSU
+DDR5
+48GB
+RAM
 ```
 
-You can also override keywords/filters at runtime:
-
-```powershell
-./deal-monitor.ps1 -Keywords "DDR5","48GB" -MaxPrice 240
-./deal-monitor.ps1 -ConfigureKeywords   # prompts and writes keywords.txt
-```
-
-### Optional: Set Keywords via Discord (Receive Commands)
-
-Discord webhooks are **send-only** (the script can post alerts, but cannot receive messages through a webhook).
-To type keywords *in Discord* and have the script pick them up, you need a **Discord bot** that can read messages in a “control” channel.
-
-**How it works:**
-- If you use the PowerShell-only approach, the script reads Discord commands **on each run** (scheduled/polling).
-- If you want instant replies and instant updates, run the always-on C# bot in [control-bot/README.md](control-bot/README.md).
-- You type commands like `!keywords set 750W, PSU, power supply` in a Discord channel.
-- On the next run, the script reads that channel via Discord’s API, updates `keywords.txt`, then continues normally.
-
-**Setup (high level):**
-- Create a bot in the Discord Developer Portal.
-- Invite it to your server with permission to **View Channel** and **Read Message History** (and optionally **Send Messages** if you enable acknowledgements).
-- Set an environment variable for the bot token:
-
-```powershell
-$env:DISCORD_BOT_TOKEN = "YOUR_BOT_TOKEN"
-```
-
-**Commands:**
-- `!keywords set kw1, kw2, kw3`
-- `!keywords help`
-- `!keywords show`
-- `!status`
-- `!maxprice 200`
-- `!mindiscount 15`
-
-Enable it in [config.json](config.json) under `discord_control`.
-
-**Instant mode (recommended for best UX):**
-- See [control-bot/README.md](control-bot/README.md) for a small always-on C# Discord bot that updates `keywords.txt` immediately and acks immediately.
-
-Edit [config.json](config.json) and update:
+**Watch mode** — add watches to `config.json` for independent search groups:
 
 ```json
 {
-  "discord_webhook_url": "YOUR_WEBHOOK_URL_HERE",
-  "keywords": [
-    "RTX 4070",
-    "2TB NVMe",
-    "AM5",
-    "DDR5"
-  ],
-  "filters": {
-    "max_price": 500,
-    "min_discount_percent": 15
-  }
+  "watches": [
+    {
+      "name": "GPU",
+      "keywords": ["5080", "5070 ti"],
+      "max_price": 1200,
+      "min_discount_percent": 0
+    },
+    {
+      "name": "MONITOR",
+      "keywords": ["1440p", "4K", "OLED"],
+      "max_price": 300,
+      "min_discount_percent": 10
+    }
+  ]
 }
 ```
 
+Each watch has its own keywords and price/discount filters. Watches take priority over simple keywords when both are set.
+
 **Configuration Options:**
 
-- **`discord_webhook_url`** - Your Discord webhook URL (required)
-- **`keywords`** - Array of terms to watch for (case-insensitive)
-- **`filters.max_price`** - Only notify for deals under this price (or `null` for no limit)
-- **`filters.min_discount_percent`** - Minimum discount % required (or `null` for no minimum)
-- **`sources`** - Array of RSS feeds or JSON endpoints to monitor
+| Field | Description |
+|-------|-------------|
+| `discord_webhook_url` | Your Discord webhook URL (required) |
+| `keywords` | Legacy keyword array (case-insensitive). Used if no watches defined. |
+| `watches` | Array of watch groups, each with `name`, `keywords[]`, `max_price`, `min_discount_percent` |
+| `filters.max_price` | Global max price fallback (number or `null`) |
+| `filters.min_discount_percent` | Global min discount % fallback (number or `null`) |
+| `filters.flairs` | Reddit flair filter (array of strings or `null`) |
+| `sources` | Array of deal sources (Reddit subreddits, RSS feeds, JSON endpoints) |
+| `discord_control` | Bot control settings (see Discord Bot section) |
 
 ### 4. Test Run
 
-Open PowerShell in the `deal-monitor` folder and run:
-
 ```powershell
-.\deal-monitor.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\deal-monitor.ps1
 ```
 
-You should see:
-- Log messages in the console
-- A `logs/` folder with today's log file
-- A `history.json` file tracking sent deals
-- Discord notifications for matching deals
+You should see log messages, matching deals sent to Discord, and `history.json` created.
 
-### 5. Schedule Automatic Runs
+### 5. CLI Flags
 
-**Option A: Using Task Scheduler GUI**
+```powershell
+.\deal-monitor.ps1 -Keywords "DDR5","48GB" -MaxPrice 240
+.\deal-monitor.ps1 -Flairs "GPU","CPU"
+.\deal-monitor.ps1 -ConfigureKeywords          # interactive keyword setup
+.\deal-monitor.ps1 -SkipDiscordControl          # skip Discord polling (used by bot's !scan)
+```
 
-1. Open **Task Scheduler** (search in Start menu)
-2. Click **Create Basic Task**
-3. Name: "Deal Monitor"
-4. Trigger: Daily at your preferred time (e.g., every 2 hours)
-5. Action: **Start a program**
+## Discord Bot (Remote Control)
+
+### Why a Bot?
+
+Discord webhooks are **send-only**. To receive commands in Discord (change keywords, trigger scans, etc.), you need a bot.
+
+### Setup
+
+1. Create a bot in the [Discord Developer Portal](https://discord.com/developers/applications)
+2. Enable **Message Content Intent** under the bot settings
+3. Invite it to your server with permissions: View Channel, Read Message History, Send Messages
+4. Set your bot token as an environment variable:
+   ```powershell
+   [Environment]::SetEnvironmentVariable('DISCORD_BOT_TOKEN', 'YOUR_TOKEN', 'User')
+   ```
+5. Configure `discord_control` in `config.json`:
+   ```json
+   "discord_control": {
+     "enabled": true,
+     "channel_id": "YOUR_CHANNEL_ID",
+     "token_env": "DISCORD_BOT_TOKEN",
+     "allowed_user_ids": ["YOUR_USER_ID"],
+     "ack": true
+   }
+   ```
+
+### Running the Bot
+
+```powershell
+cd control-bot
+$env:DISCORD_BOT_TOKEN = [Environment]::GetEnvironmentVariable('DISCORD_BOT_TOKEN', 'User')
+$env:DEAL_MONITOR_DIR = "E:\IS305\deal-monitor"
+dotnet run -c Release
+```
+
+> **Important:** Only run one bot instance at a time — multiple instances cause duplicate responses.
+
+### Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `!help` | Full command reference with examples and notes |
+| `!scan` | Run the deal monitor immediately and report results |
+| `!clearhistory` | Reset seen-deals history so all deals re-send |
+| `!watch add Name \| kw1, kw2 \| max:500 \| discount:15` | Create/update a watch group |
+| `!watch list` | Show all active watches with their filters |
+| `!watch remove Name` | Delete a watch by name |
+| `!watch clear` | Remove all watches |
+| `!keywords set kw1, kw2, kw3` | Replace simple keywords (comma-separated) |
+| `!keywords show` | Show current keywords |
+| `!maxprice 200` | Set global max price filter |
+| `!mindiscount 15` | Set global min discount % filter |
+| `!status` | Show current config summary |
+| `!ping` | Check if bot is alive |
+
+**Examples:**
+```
+!watch add GPU | 5080, 5070 ti | max:1200
+!watch add MONITOR | 1440p, 4K | max:300 | discount:10
+!watch list
+!scan
+!clearhistory
+```
+
+## Multi-Watch System
+
+Watches let you search for different product categories with independent filters:
+
+```
+GPU watch:     keywords=["5080"]      max=$1200  discount=0%
+MONITOR watch: keywords=["1440p"]     max=$165   discount=0%
+CPU watch:     keywords=["9800X3D"]   max=$500   discount=10%
+```
+
+- First matching watch wins for each deal
+- Each watch's price/discount filters are independent
+- Discord notifications show which watch matched: `[GPU] RTX 5080 - $1149.99`
+- If no watches are defined, falls back to legacy `keywords` + `filters` mode
+
+## How Hotness Scoring Works
+
+Each deal gets a "hotness score" (0-100 points):
+
+| Factor | Points |
+|--------|--------|
+| Discount % | Up to 50 pts (1:1 with discount %) |
+| Price < $100 | +20 pts |
+| Price $100–$299 | +15 pts |
+| Price $300–$499 | +10 pts |
+| Price $500–$999 | +5 pts |
+| Keyword matches | +5 pts each (max 30) |
+
+**Discord Color Coding:**
+- 🔴 **Red** (70+) — HOT DEAL
+- 🟠 **Orange** (50–69) — Great deal
+- 🔵 **Blue** (30–49) — Good deal
+- ⚪ **Gray** (0–29) — Decent deal
+
+## Schedule Automatic Runs
+
+### Task Scheduler (GUI)
+
+1. Open **Task Scheduler** → **Create Basic Task**
+2. Name: "Deal Monitor"
+3. Trigger: Repeat every 2 hours (or your preference)
+4. Action: Start a program
    - Program: `powershell.exe`
-  - Arguments: `-ExecutionPolicy Bypass -File "E:\IS305\deal-monitor\deal-monitor.ps1"`
-  - Start in: `E:\IS305\deal-monitor`
-6. Finish and enable the task
+   - Arguments: `-ExecutionPolicy Bypass -File "E:\IS305\deal-monitor\deal-monitor.ps1"`
+   - Start in: `E:\IS305\deal-monitor`
 
-**Option B: Using PowerShell Command**
-
-Run this in PowerShell (as Administrator):
+### Task Scheduler (PowerShell)
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
   -Argument '-ExecutionPolicy Bypass -File "E:\IS305\deal-monitor\deal-monitor.ps1"' `
   -WorkingDirectory "E:\IS305\deal-monitor"
 
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 2)
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+  -RepetitionInterval (New-TimeSpan -Hours 2)
 
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$settings = New-ScheduledTaskSettingsSet `
+  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
 Register-ScheduledTask -TaskName "DealMonitor" `
-    -Action $action `
-    -Trigger $trigger `
-    -Settings $settings `
-    -Description "Automated PC parts deal monitoring with Discord notifications"
+  -Action $action -Trigger $trigger -Settings $settings `
+  -Description "Automated PC parts deal monitoring with Discord notifications"
 ```
-
-**Run every 2 hours:**
-```powershell
-# Modify the trigger line above to:
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 2)
-```
-
-**Run every 30 minutes:**
-```powershell
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30)
-```
-
-## Usage Examples
-
-### Example 1: GPU Deals Under $600 with 20%+ Discount
-
-```json
-{
-  "keywords": ["RTX 4070", "RTX 4060", "RX 7800"],
-  "filters": {
-    "max_price": 600,
-    "min_discount_percent": 20
-  }
-}
-```
-
-### Example 2: Any SSD Deal (No Price Limit)
-
-```json
-{
-  "keywords": ["NVMe", "SSD", "M.2", "2TB", "1TB"],
-  "filters": {
-    "max_price": null,
-    "min_discount_percent": 10
-  }
-}
-```
-
-### Example 3: High-End Components Only
-
-```json
-{
-  "keywords": [
-    "RTX 4090",
-    "Ryzen 9 7950X",
-    "Intel Core i9-14900K",
-    "DDR5 6000MHz",
-    "4TB NVMe"
-  ],
-  "filters": {
-    "max_price": 2000,
-    "min_discount_percent": 15
-  }
-}
-```
-
-## How Hotness Scoring Works
-
-Each deal gets a "hotness score" (0-100 points):
-
-- **Discount Percentage**: Up to 50 points (50% off = 50 points)
-- **Price Threshold Bonus**: 
-  - Under $100 = +20 points
-  - $100-$299 = +15 points
-  - $300-$499 = +10 points
-  - $500-$999 = +5 points
-- **Keyword Match Strength**: +5 points per matched keyword (max 30)
-
-**Color Coding in Discord:**
-- 🔴 **Red** (70+ points) - HOT DEAL
-- 🟠 **Orange** (50-69 points) - Great deal
-- 🔵 **Blue** (30-49 points) - Good deal
-- ⚪ **Gray** (0-29 points) - Decent deal
 
 ## Adding More Sources
 
-### Reddit RSS Feeds
+### Multiple Subreddits
 
 ```json
-{
-  "type": "rss",
-  "name": "r/buildapcsales",
-  "url": "https://www.reddit.com/r/buildapcsales/.rss"
-}
+"sources": [
+  { "type": "reddit", "name": "buildapcsales", "subreddit": "buildapcsales" },
+  { "type": "reddit", "name": "deals", "subreddit": "deals" },
+  { "type": "reddit", "name": "hardwareswap", "subreddit": "hardwareswap" }
+]
 ```
 
-### Slickdeals RSS
+### RSS Feeds
 
 ```json
-{
-  "type": "rss",
-  "name": "Slickdeals Popular",
-  "url": "https://slickdeals.net/newsearch.php?mode=popdeals&searcharea=deals&searchin=first&rss=1"
-}
+{ "type": "rss", "name": "Slickdeals", "url": "https://slickdeals.net/newsearch.php?mode=popdeals&searcharea=deals&searchin=first&rss=1" }
 ```
 
 ### Custom JSON API
 
 ```json
-{
-  "type": "json",
-  "name": "Custom Store API",
-  "url": "https://api.example.com/deals"
-}
-```
-
-**JSON API Expected Format:**
-```json
-[
-  {
-    "title": "Product Name",
-    "url": "https://...",
-    "description": "Deal description",
-    "price": 299.99,
-    "original_price": 399.99,
-    "date": "2026-02-01T12:00:00Z"
-  }
-]
+{ "type": "json", "name": "Custom Store API", "url": "https://api.example.com/deals" }
 ```
 
 ## File Structure
 
 ```
 deal-monitor/
-│
-├── deal-monitor.ps1      # Main script
-├── config.json           # Configuration file
-├── history.json          # Tracks sent deals (auto-created)
-├── README.md             # This file
-│
-└── logs/                 # Daily log files (auto-created)
-    ├── deal-monitor_2026-02-01.log
-    └── deal-monitor_2026-02-02.log
+├── deal-monitor.ps1          # Main script (~1500 lines)
+├── config.json               # Runtime configuration (gitignored)
+├── config.example.json       # Template for new setups
+├── keywords.txt              # Simple keyword list (one per line)
+├── history.json              # Sent deal IDs (auto-created)
+├── control_state.json        # Last processed Discord message ID
+├── test-notification.ps1     # Quick webhook test
+├── .gitignore
+├── .github/
+│   └── copilot-instructions.md
+├── control-bot/              # C# Discord bot
+│   ├── Program.cs
+│   ├── control-bot.csproj
+│   └── README.md
+├── logs/                     # Daily logs (auto-created, auto-rotated)
+│   └── deal-monitor_YYYY-MM-DD.log
+└── data/                     # (if applicable)
 ```
 
 ## Troubleshooting
 
 ### No Discord Notifications
+1. Check webhook URL — test manually with `test-notification.ps1`
+2. Check filters — keywords might not match or price/discount filters too strict
+3. Check logs — `logs/deal-monitor_YYYY-MM-DD.log`
 
-1. **Check webhook URL** - Test it manually:
-   ```powershell
-   $webhook = "YOUR_WEBHOOK_URL"
-   $body = @{ content = "Test message" } | ConvertTo-Json
-   Invoke-RestMethod -Uri $webhook -Method Post -Body $body -ContentType "application/json"
-   ```
+### Duplicate Bot Responses
+Multiple bot instances are running. Kill all `dotnet`/`control-bot` processes and start only one.
 
-2. **Check filters** - Your keywords might not be matching or filters are too strict
+### Price Shows Wrong
+The price regex handles `$1149.99`, `$1,299.00`, `$50`, etc. If a price format isn't captured, check `Extract-PriceInfo` in the script.
 
-3. **Check logs** - Look in `logs/deal-monitor_YYYY-MM-DD.log` for errors
+### `!scan` Shows Wrong Numbers or Help Text
+Fixed in latest version. The scan now uses `-SkipDiscordControl` to prevent the PS script from polling Discord during a bot-triggered scan.
 
-### Script Not Running on Schedule
-
-1. **Check Task Scheduler** - Ensure the task is enabled
-2. **Verify PowerShell path** - Should be `powershell.exe` (not `pwsh.exe`)
-3. **Check execution policy** - Use `-ExecutionPolicy Bypass` in arguments
-4. **Verify working directory** - Must be set to the script folder
+### Bot Shows 401 Unauthorized
+The `DISCORD_BOT_TOKEN` environment variable is missing in that terminal session. Set it explicitly before running.
 
 ### Deals Already Sent
-
-The script tracks sent deals in `history.json`. To reset:
-- Delete `history.json` or remove specific deal IDs from the file
-
-### RSS Feed Not Working
-
-Some RSS feeds may have different structures. Check the logs for parsing errors. You may need to modify the `Fetch-RSSFeed` function to handle specific feed formats.
-
-## Advanced Configuration
-
-### Multiple Configurations
-
-Run different configs for different purposes:
-
-```powershell
-# GPU-specific monitoring
-.\deal-monitor.ps1 -ConfigPath ".\config-gpu.json"
-
-# Storage-specific monitoring
-.\deal-monitor.ps1 -ConfigPath ".\config-storage.json"
-```
-
-### Custom Price Extraction
-
-If a deal source has a specific price format, modify the `Extract-PriceInfo` function in [deal-monitor.ps1](deal-monitor.ps1#L220).
-
-### Rate Limiting
-
-The script waits 2 seconds between Discord notifications by default. Adjust on [line 663](deal-monitor.ps1#L663):
-
-```powershell
-Start-Sleep -Seconds 2  # Change to desired delay
-```
+Use `!clearhistory` in Discord, or delete `history.json` manually.
 
 ## Best Practices
 
-✅ **Start with broader keywords** - "RTX 4070" instead of "ASUS RTX 4070 Ti Super OC"  
-✅ **Use reasonable filters** - Don't set `min_discount_percent` too high  
-✅ **Check logs regularly** - Monitor for errors or missed deals  
-✅ **Clean history periodically** - Script auto-trims to last 1000 deals  
-✅ **Test before scheduling** - Run manually first to verify configuration  
+✅ **Use watches** for different product categories with their own price limits  
+✅ **Start with broader keywords** — "5080" instead of "ASUS ROG STRIX RTX 5080 OC"  
+✅ **Use `!scan` to test** — don't wait for the schedule  
+✅ **Check logs regularly** — monitor for errors or missed deals  
+✅ **Run only one bot instance** — avoid duplicate responses  
+✅ **Keep keywords case-insensitive** — `1440p` matches `1440P` automatically  
 
 ## License
 
 Free to use and modify for personal use.
-
-## Support
-
-For issues or questions:
-1. Check the logs in `logs/` folder
-2. Verify your `config.json` is valid JSON
-3. Test the Discord webhook manually
-4. Review PowerShell execution policy settings
 
 ---
 
