@@ -8,9 +8,31 @@
     "DDR5"
   ],
   
+  "watches": [
+    {
+      "name": "GPU Deals",
+      "keywords": ["RTX 4070", "RTX 4060", "RX 7800", "RX 9070"],
+      "max_price": 700,
+      "min_discount_percent": 10
+    },
+    {
+      "name": "CPU Deals",
+      "keywords": ["Ryzen 7", "Ryzen 9", "i7-14", "i9-14"],
+      "max_price": 400,
+      "min_discount_percent": 15
+    },
+    {
+      "name": "Storage",
+      "keywords": ["NVMe", "SSD", "2TB", "4TB"],
+      "max_price": 200,
+      "min_discount_percent": 20
+    }
+  ],
+  
   "filters": {
     "max_price": 500,
-    "min_discount_percent": 15
+    "min_discount_percent": 15,
+    "flairs": ["GPU", "SSD", "RAM", "CPU"]
   },
   
   "sources": [
@@ -18,6 +40,17 @@
       "type": "reddit",
       "name": "Reddit r/buildapcsales",
       "subreddit": "buildapcsales"
+    },
+    {
+      "type": "reddit",
+      "name": "Reddit r/deals",
+      "subreddit": "deals"
+    },
+    {
+      "type": "reddit",
+      "name": "Reddit r/hardwareswap",
+      "subreddit": "hardwareswap",
+      "flairs": ["SELLING"]
     }
   ],
 
@@ -33,10 +66,12 @@
   
   "_comments": {
     "discord_webhook_url": "Get this from Discord: Server Settings > Integrations > Webhooks > New Webhook",
-    "keywords": "Add all terms you want to monitor. Case-insensitive matching.",
+    "keywords": "Fallback keywords if no watches are defined. Case-insensitive matching.",
+    "watches": "Array of watch groups, each with its own name, keywords, max_price, min_discount_percent. A deal matches if ANY watch matches. If omitted, falls back to top-level keywords + filters.",
     "filters": {
       "max_price": "Set a number to only get deals under that price (or null for no limit)",
-      "min_discount_percent": "Minimum discount percentage to notify (or null for no minimum)"
+      "min_discount_percent": "Minimum discount percentage to notify (or null for no minimum)",
+      "flairs": "Optional array of Reddit flair keywords to match (e.g. GPU, SSD). Empty or omitted = all flairs"
     },
     "discord_control": {
       "enabled": "Set true to allow receiving commands from a Discord bot in a control channel (webhooks cannot receive messages)",
