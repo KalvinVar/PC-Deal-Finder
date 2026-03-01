@@ -4,9 +4,9 @@ A PowerShell-based deal monitoring system that tracks Reddit and other deal sour
 
 ## Features
 
-✅ **Multi-Source Support** - Monitor multiple subreddits, RSS feeds, and JSON endpoints  
-✅ **Multi-Watch System** - Create independent search groups (e.g., GPUs under $1200 AND monitors under $200) each with their own keywords and filters  
-✅ **Smart Filtering** - Filter by keywords, max price, minimum discount %, and Reddit flairs  
+✅ **Multi-Source Support** - Monitor multiple subreddits (buildapcsales, deals, hardwareswap), RSS feeds, and JSON endpoints  
+✅ **Multi-Watch System** - Create independent search groups (e.g., GPUs under $1200 AND monitors under $200) each with their own keywords, filters, and optional flair type filter  
+✅ **Smart Filtering** - Filter by keywords, max price, minimum discount %, and per-watch Reddit flair (type:)  
 ✅ **Hotness Scoring** - Automatically scores deals based on discount %, price threshold, and keyword relevance  
 ✅ **Discord Notifications** - Rich embedded notifications with color-coded urgency  
 ✅ **Discord Bot Control** - Always-on C# bot for instant command responses (`!scan`, `!watch`, `!clearhistory`, etc.)  
@@ -58,12 +58,24 @@ RAM
       "keywords": ["1440p", "4K", "OLED"],
       "max_price": 300,
       "min_discount_percent": 10
+    },
+    {
+      "name": "HSwapGPU",
+      "keywords": ["RTX 4090", "RTX 5080", "RX 9070"],
+      "flairs": ["SELLING"]
+    },
+    {
+      "name": "DealsElec",
+      "keywords": ["RTX", "laptop", "SSD", "headphones"],
+      "flairs": ["computers & electronics"]
     }
   ]
 }
 ```
 
-Each watch has its own keywords and price/discount filters. Watches take priority over simple keywords when both are set.
+Each watch has its own keywords, price/discount filters, and optional `flairs` array. Watches take priority over simple keywords when both are set.
+
+> **Note:** Reddit returns flair text HTML-encoded (e.g. `computers &amp; electronics`). Always write flair values in config with a literal `&` — the script automatically decodes before comparing.
 
 **Configuration Options:**
 
@@ -71,7 +83,7 @@ Each watch has its own keywords and price/discount filters. Watches take priorit
 |-------|-------------|
 | `discord_webhook_url` | Your Discord webhook URL (required) |
 | `keywords` | Legacy keyword array (case-insensitive). Used if no watches defined. |
-| `watches` | Array of watch groups, each with `name`, `keywords[]`, `max_price`, `min_discount_percent` |
+| `watches` | Array of watch groups, each with `name`, `keywords[]`, `max_price`, `min_discount_percent`, optional `flairs[]` |
 | `filters.max_price` | Global max price fallback (number or `null`) |
 | `filters.min_discount_percent` | Global min discount % fallback (number or `null`) |
 | `filters.flairs` | Reddit flair filter (array of strings or `null`) |
@@ -139,14 +151,15 @@ dotnet run -c Release
 | `!help` | Full command reference with examples and notes |
 | `!scan` | Run the deal monitor immediately and report results |
 | `!clearhistory` | Reset seen-deals history so all deals re-send |
-| `!watch add Name \| kw1, kw2 \| max:500 \| discount:15` | Create/update a watch group |
+| `!watch add Name \| kw1, kw2 \| max:500 \| discount:15 \| type:SELLING` | Create/update a watch group (type: = flair filter) |
 | `!watch list` | Show all active watches with their filters |
 | `!watch remove Name` | Delete a watch by name |
 | `!watch clear` | Remove all watches |
-| `!keywords set kw1, kw2, kw3` | Replace simple keywords (comma-separated) |
+| `!keywords set kw1, kw2, kw3` | Replace simple keywords (ignored when watches exist) |
 | `!keywords show` | Show current keywords |
 | `!maxprice 200` | Set global max price filter |
 | `!mindiscount 15` | Set global min discount % filter |
+| `!scaninterval 2d` / `!scaninterval 30` / `!scaninterval off` | Set auto-scan interval (supports days + minutes) |
 | `!status` | Show current config summary |
 | `!ping` | Check if bot is alive |
 
@@ -154,7 +167,11 @@ dotnet run -c Release
 ```
 !watch add GPU | 5080, 5070 ti | max:1200
 !watch add MONITOR | 1440p, 4K | max:300 | discount:10
+!watch add HSwapGPU | RTX 4090, RTX 5080 | type:SELLING
+!watch add DealsElec | RTX, laptop, SSD | type:computers & electronics
 !watch list
+!scaninterval 2d
+!scaninterval 1d 30
 !scan
 !clearhistory
 ```
@@ -164,15 +181,26 @@ dotnet run -c Release
 Watches let you search for different product categories with independent filters:
 
 ```
-GPU watch:     keywords=["5080"]      max=$1200  discount=0%
-MONITOR watch: keywords=["1440p"]     max=$165   discount=0%
-CPU watch:     keywords=["9800X3D"]   max=$500   discount=10%
+GPU watch:      keywords=["5080"]            max=$1200  discount=0%
+MONITOR watch:  keywords=["1440p"]           max=$165   discount=0%
+CPU watch:      keywords=["9800X3D"]         max=$500   discount=10%
+HSwapGPU watch: keywords=["RTX 4090"]        type=SELLING  (hardwareswap sellers only)
+DealsElec watch: keywords=["RTX","laptop"]   type=computers & electronics  (r/deals only)
 ```
 
 - First matching watch wins for each deal
 - Each watch's price/discount filters are independent
+- Optional `flairs` array restricts matches to posts with a matching Reddit flair (`type:` in bot commands)
 - Discord notifications show which watch matched: `[GPU] RTX 5080 - $1149.99`
 - If no watches are defined, falls back to legacy `keywords` + `filters` mode
+
+### Flair Values by Subreddit
+
+| Subreddit | Common Flairs |
+|-----------|---------------|
+| r/buildapcsales | `GPU`, `Monitor`, `SSD`, `CPU`, `RAM`, `Laptop`, `Keyboard`, `Mouse` |
+| r/hardwareswap | `SELLING`, `BUYING` |
+| r/deals | `computers & electronics`, `home and garden`, `tools`, `clothing & jewelry`, `toys`, `cars & automotives`, `food & drink`, `travel`, `pets`, `Refurbished` |
 
 ## How Hotness Scoring Works
 
@@ -251,7 +279,7 @@ Register-ScheduledTask -TaskName "DealMonitor" `
 
 ```
 deal-monitor/
-├── deal-monitor.ps1          # Main script (~1500 lines)
+├── deal-monitor.ps1          # Main script (~1680 lines)
 ├── config.json               # Runtime configuration (gitignored)
 ├── config.example.json       # Template for new setups
 ├── keywords.txt              # Simple keyword list (one per line)
@@ -274,8 +302,9 @@ deal-monitor/
 
 ### No Discord Notifications
 1. Check webhook URL — test manually with `test-notification.ps1`
-2. Check filters — keywords might not match or price/discount filters too strict
-3. Check logs — `logs/deal-monitor_YYYY-MM-DD.log`
+2. Check filters — keywords might not match, price/discount filters too strict, or flair mismatch
+3. Check logs — `logs/deal-monitor_YYYY-MM-DD.log` — look for `Deal skipped by watch` lines showing which filter blocked it
+4. Flair mismatch — ensure your `type:` value uses a literal `&` (not `&amp;`), e.g. `type:computers & electronics`
 
 ### Duplicate Bot Responses
 Multiple bot instances are running. Kill all `dotnet`/`control-bot` processes and start only one.
@@ -294,7 +323,9 @@ Use `!clearhistory` in Discord, or delete `history.json` manually.
 
 ## Best Practices
 
-✅ **Use watches** for different product categories with their own price limits  
+✅ **Use watches** for different product categories with their own price limits and flair filters  
+✅ **Use `type:SELLING`** on hardwareswap watches to skip WTB posts automatically  
+✅ **Use `type:computers & electronics`** on r/deals watches to avoid irrelevant categories  
 ✅ **Start with broader keywords** — "5080" instead of "ASUS ROG STRIX RTX 5080 OC"  
 ✅ **Use `!scan` to test** — don't wait for the schedule  
 ✅ **Check logs regularly** — monitor for errors or missed deals  

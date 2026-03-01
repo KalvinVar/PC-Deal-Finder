@@ -4,13 +4,14 @@
 - Main runner is the PowerShell script [deal-monitor.ps1](../deal-monitor.ps1). It:
   - Loads settings from [config.json](../config.json)
   - Loads keywords from [keywords.txt](../keywords.txt) (preferred UX)
-  - Supports **multi-watch** mode: each watch in `config.watches[]` has its own name, keywords, max_price, min_discount_percent. Falls back to legacy single-keyword mode if no watches defined.
+  - Supports **multi-watch** mode: each watch in `config.watches[]` has its own name, keywords, max_price, min_discount_percent, and optional flairs array. Falls back to legacy single-keyword mode if no watches defined.
   - Fetches deals from `sources` (most reliable: `type: "reddit"` via Reddit public JSON)
   - Filters + scores matches via `Filter-Deal` (iterates watches, first match wins)
   - Sends Discord webhook notifications (UTF-8 bytes, with 429 rate-limit retry)
   - Dedupes using [history.json](../history.json) (MD5-like 32-hex IDs, crash-safe per-send saves)
   - Writes daily logs to [logs/](../logs/) with auto-rotation (deletes logs older than 30 days)
-  - Supports Reddit flair/category filtering via `-Flairs` CLI param or `filters.flairs` config
+  - Per-watch flair filtering: if a watch has a `flairs` array, the post's `link_flair_text` must match (HTML-decoded before comparison)
+  - Skips r/hardwareswap WTB posts: if `[H]` section contains only payment/location words, the post is skipped
 
 - Optional Discord "control channel" exists in two modes:
   - Polling mode (PowerShell): `Try-ApplyDiscordControl` reads recent channel messages on each run and updates `keywords.txt` / filters / watches.
@@ -19,14 +20,16 @@
 ## Key files and conventions
 - [config.json](../config.json)
   - `discord_webhook_url`: send-only notifications (treat as secret)
-  - `filters`: `max_price` (number or `null`), `min_discount_percent` (int or `null`), `flairs` (array of strings or `null`)
-  - `sources`: prefer `{"type":"reddit","subreddit":"buildapcsales"}`; supports multiple subreddits. RSS/scraping are less reliable.
+  - `filters`: `max_price` (number or `null`), `min_discount_percent` (int or `null`)
+  - `sources`: supports multiple Reddit subreddits (currently: buildapcsales, deals, hardwareswap). RSS/scraping are less reliable.
   - `discord_control`: `{ enabled, channel_id, token_env, allowed_user_ids, ack }`
-  - `watches`: array of `{ name, keywords[], max_price, min_discount_percent }` — each watch is an independent search group with its own filters
+  - `watches`: array of `{ name, keywords[], max_price, min_discount_percent, flairs[] }` — each watch is an independent search group with its own filters and optional flair filter
+  - `scan_interval_minutes`: auto-scan interval in minutes (used by control bot; 0 = disabled)
 - [keywords.txt](../keywords.txt)
   - One keyword per line; `#` comments allowed.
   - Keyword priority in PowerShell: CLI `-Keywords` → `keywords.txt` → `config.json` keywords.
   - Keywords are **case-insensitive** (PowerShell `-match` is case-insensitive by default).
+  - When watches are defined, keywords.txt is silently ignored (watches take priority).
 - [history.json](../history.json)
   - Stores string IDs; loader is intentionally repair-tolerant (it extracts any 32-hex tokens and rewrites a clean JSON array).
   - Saved after each notification send (crash-safe), not batched at end of run.
@@ -36,13 +39,16 @@
 ## Discord bot commands
 The C# bot supports these commands in the control channel:
 - `!help` — Full command reference with descriptions and notes
-- `!keywords set kw1, kw2` / `!keywords show` — Manage simple keywords
-- `!watch add Name | kw1, kw2 | max:500 | discount:15` — Create/update a watch group
+- `!keywords set kw1, kw2` / `!keywords show` — Manage simple keywords (ignored when watches exist)
+- `!watch add Name | kw1, kw2 | max:500 | discount:15 | type:SELLING` — Create/update a watch group (type: sets flair filter)
 - `!watch list` / `!watch remove Name` / `!watch clear` — Manage watches
 - `!maxprice 200` / `!mindiscount 15` — Set global filters
+- `!scaninterval 2d` / `!scaninterval 1d 30` / `!scaninterval 30` / `!scaninterval off` — Set auto-scan interval (days + minutes)
 - `!scan` — Run deal-monitor.ps1 on-demand (passes `-SkipDiscordControl` to avoid polling loop; prevents concurrent scans; reports summary back to Discord)
 - `!clearhistory` — Reset seen-deals history so all deals re-send
 - `!status` / `!ping`
+
+Slash command equivalents exist for all the above (registered on bot startup).
 
 ## Running locally
 - Deal monitor (PowerShell 5.1+):
@@ -57,14 +63,26 @@ The C# bot supports these commands in the control channel:
 
 ## Scheduling (Windows)
 - Use Task Scheduler to run the PowerShell script; examples live in [TASK_SCHEDULER_SETUP.md](../TASK_SCHEDULER_SETUP.md) but paths are machine-specific—update `E:\...\deal-monitor` accordingly.
+- The C# bot also has a built-in auto-scan loop driven by `scan_interval_minutes` in config — but this only works while the bot process stays running.
 
 ## Debugging and gotchas
 - Logs: check [logs/](../logs/) for `deal-monitor_YYYY-MM-DD.log`.
 - Windows PowerShell 5.1 UTF-8: Discord REST calls must send UTF-8 JSON bytes (see `Invoke-DiscordApi`), otherwise Discord may reject payloads.
 - If the C# bot shows gateway `401 Unauthorized`, the token env var is missing/incorrect in *that* process context.
 - Price parsing regex: `\$\s*(\d[\d,]*(?:\.\d{1,2})?)` — handles prices like `$1149.99`, `$1,299.00`, `$50`.
+- Hardwareswap price detection: also handles prices without `$` sign when followed by payment keyword (shipped/OBO/PayPal/etc).
+- Flair matching: Reddit JSON returns HTML-encoded flair text (e.g., `computers &amp; electronics`). The script HTML-decodes it via `[System.Net.WebUtility]::HtmlDecode()` before comparing against watch flairs. Always store flair values in config with literal `&`, not `&amp;`.
 - Multiple bot instances: Kill all `dotnet`/`control-bot` processes before starting a new one to avoid duplicate responses.
 - `!scan` runs the PS script with `-SkipDiscordControl` so it doesn't poll Discord and respond to stale messages during a bot-triggered scan.
+- `keywords.txt` is silently ignored whenever watches exist — `!status` shows a warning about this.
+
+## Watch flair filtering (type:)
+- Each watch can have a `flairs` array in config: `{ "name": "HSwapGPU", "keywords": ["RTX 4090"], "flairs": ["SELLING"] }`
+- Set via bot: `!watch add HSwapGPU | RTX 4090 | type:SELLING`
+- r/hardwareswap flairs: `SELLING`, `BUYING`
+- r/deals flairs: `computers & electronics`, `home and garden`, `tools`, `clothing & jewelry`, `toys`, `cars & automotives`, `food & drink`, `travel`, `pets`, `Refurbished`
+- r/buildapcsales flairs: `GPU`, `Monitor`, `SSD`, `CPU`, `RAM`, `Keyboard`, `Mouse`, `Laptop`, etc.
+- No flair filter on a watch = matches any post regardless of flair
 
 ## When changing code
 - Keep PowerShell compatible with 5.1 (TLS 1.2 setup, avoid PS7-only syntax).
@@ -72,3 +90,4 @@ The C# bot supports these commands in the control channel:
 - Preserve crash-safe history saves (save after each send, not batched).
 - Avoid adding brittle store-specific scraping; prefer Reddit JSON or explicit JSON endpoints.
 - When adding watch commands, update both PowerShell `Try-ApplyDiscordControl` and C# bot `OnMessageReceivedAsync`.
+- When adding slash commands, register them in `RegisterSlashCommandsAsync()` and add a handler case in `HandleSlashCommandAsync()`.
