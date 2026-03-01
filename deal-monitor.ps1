@@ -149,6 +149,22 @@ function Load-KeywordsFromFile {
     }
 }
 
+function Normalize-Keyword {
+    <#
+    .SYNOPSIS
+        Normalizes a keyword string: collapses extra whitespace and strips leading
+        zeros from embedded numbers (e.g. "050W" -> "50W", "01440p" -> "1440p").
+        Prevents accidental misses caused by copy-paste formatting differences.
+    #>
+    param([string]$Keyword)
+
+    # 1. Trim and collapse internal whitespace
+    $k = ($Keyword.Trim() -replace '\s+', ' ')
+    # 2. Strip leading zeros from numbers embedded in text
+    $k = $k -replace '\b0+(\d)', '$1'
+    return $k
+}
+
 function Ensure-ConfigFilters {
     param([Parameter(Mandatory=$true)]$Config)
 
@@ -465,19 +481,22 @@ function Try-ApplyDiscordControl {
 
         if ($trim -match '^!(?:dealmonitor\s+)?(?:keywords\s+help|help)$') {
             $responseMessage = @(
-                ':information_source: Deal Monitor control commands:',
-                '**Keywords (simple mode):**',
-                '- !keywords set kw1, kw2, kw3',
-                '- !keywords show',
-                '**Watches (multi-search with per-group filters):**',
-                '- !watch add Name | kw1, kw2 | max:500 | discount:15',
-                '- !watch list',
-                '- !watch remove Name',
-                '- !watch clear',
-                '**Global filters:**',
-                '- !maxprice 200',
-                '- !mindiscount 15',
-                '- !status'
+                ':information_source: **Deal Monitor — Commands**',
+                '',
+                '**Watches** — configure keywords, price limit, and optional deal type per watch',
+                '- !watch add GPU | RTX 5080, 5070 Ti | max:1200 | discount:10 | type:GPU',
+                '  name | keywords | max: | discount: | type: (type= optional Reddit flair filter)',
+                '- !watch list / !watch remove GPU / !watch clear',
+                '',
+                '**Scanning**',
+                '- !scan  (check for deals now)',
+                '- !scaninterval 2d / !scaninterval 30 / !scaninterval 1d 30  (auto-scan interval)',
+                '- !scaninterval off',
+                '',
+                '**Other**',
+                '- !clearhistory  !status  !ping',
+                '',
+                'Tip: type: is optional — without it a watch matches all deal categories.'
             ) -join "`n"
             continue
         }
@@ -496,17 +515,43 @@ function Try-ApplyDiscordControl {
         if ($trim -match '^!status$') {
             $current = Load-KeywordsFromFile -Path $KeywordsFilePath
             $kwText = if ($current -and ($current | Measure-Object).Count -gt 0) { ($current -join ', ') } else { '(none)' }
-            $maxP = $Config.filters.max_price
-            $minD = $Config.filters.min_discount_percent
-            # Include watches summary
-            $watchCount = 0
-            $watchSummary = ''
-            if ($Config.watches -and ($Config.watches | Measure-Object).Count -gt 0) {
-                $watchCount = ($Config.watches | Measure-Object).Count
-                $watchNames = @($Config.watches | ForEach-Object { $_.name }) -join ', '
-                $watchSummary = " | watches=$watchCount ($watchNames)"
+            $hasWatches = $Config.watches -and ($Config.watches | Measure-Object).Count -gt 0
+            # History count
+            $histCount = 0
+            $histPath2 = Join-Path $ScriptPath 'history.json'
+            if (Test-Path $histPath2) {
+                try { $hc = Get-Content $histPath2 -Raw | ConvertFrom-Json; $histCount = if ($hc -is [array]) { $hc.Count } else { 0 } } catch { }
             }
-            $responseMessage = ":information_source: Status | keywords=$kwText | max_price=$maxP | min_discount_percent=$minD$watchSummary"
+            # Watches
+            $watchLines = '(none)'
+            if ($hasWatches) {
+                $watchLines = @($Config.watches | ForEach-Object {
+                    $wn = $_.name; $wk = @($_.keywords) -join ', '
+                    $wmp = if ($null -ne $_.max_price) { " max=`$$($_.max_price)" } else { '' }
+                    $wmd = if ($null -ne $_.min_discount_percent) { " discount=$($_.min_discount_percent)%" } else { '' }
+                    $wfl = if ($_.flairs -and ($_.flairs | Measure-Object).Count -gt 0) { " type=$(@($_.flairs) -join ',')" } else { '' }
+                    "$wn [$wk]$wmp$wmd$wfl"
+                }) -join ' | '
+            }
+            # Keywords warning
+            $kwNote = if ($hasWatches -and $current -and ($current | Measure-Object).Count -gt 0) { ' [!] ignored - watches take priority' } else { '' }
+            # Auto-scan
+            $scanMins = if ($Config.scan_interval_minutes -and [int]$Config.scan_interval_minutes -gt 0) { [int]$Config.scan_interval_minutes } else { 0 }
+            if ($scanMins -gt 0) {
+                $scanD = [math]::Floor($scanMins / 1440); $scanM = $scanMins % 1440
+                $scanParts = @()
+                if ($scanD -gt 0) { $scanParts += "$scanD day$(if ($scanD -ne 1) {'s'})" }
+                if ($scanM -gt 0) { $scanParts += "$scanM min" }
+                $scanText = "every $($scanParts -join ' ')"
+            } else { $scanText = 'off' }
+            $plural = if ($histCount -ne 1) { 's' } else { '' }
+            $responseMessage = @(
+                ':information_source: **Status**',
+                "**Watches:** $watchLines",
+                "**Keywords (keywords.txt):** $kwText$kwNote",
+                "**History:** $histCount deal$plural seen",
+                "**Auto-scan:** $scanText"
+            ) -join "`n"
             continue
         }
 
@@ -520,9 +565,10 @@ function Try-ApplyDiscordControl {
                 foreach ($w in $Config.watches) {
                     $wName = if ($w.name) { $w.name } else { '(unnamed)' }
                     $wKw = @($w.keywords) -join ', '
-                    $wMax = if ($null -ne $w.max_price) { $w.max_price } else { 'any' }
+                    $wMax = if ($null -ne $w.max_price) { "`$$($w.max_price)" } else { 'any' }
                     $wDisc = if ($null -ne $w.min_discount_percent) { "$($w.min_discount_percent)%" } else { 'any' }
-                    $lines += "- **$wName**: keywords=[$wKw] max_price=$wMax min_discount=$wDisc"
+                    $wType = if ($w.flairs -and ($w.flairs | Measure-Object).Count -gt 0) { " type=$(@($w.flairs) -join ',')" } else { '' }
+                    $lines += "- **$wName**: keywords=[$wKw] max=$wMax discount=$wDisc$wType"
                 }
                 $responseMessage = $lines -join "`n"
             }
@@ -537,17 +583,19 @@ function Try-ApplyDiscordControl {
                 continue
             }
             $watchName = $parts[0].Trim()
-            $watchKeywords = @($parts[1] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $watchKeywords = @($parts[1] -split ',' | ForEach-Object { Normalize-Keyword $_.Trim() } | Where-Object { $_ })
             if (-not $watchName -or $watchKeywords.Count -eq 0) {
                 $responseMessage = ':warning: Need a name and at least one keyword.'
                 continue
             }
             $watchMaxPrice = $null
             $watchMinDiscount = $null
+            $watchFlairs = @()
             for ($i = 2; $i -lt $parts.Count; $i++) {
                 $seg = $parts[$i].Trim()
                 if ($seg -match '^max:\s*(\d+(?:\.\d+)?)$') { $watchMaxPrice = [double]$Matches[1] }
                 elseif ($seg -match '^discount:\s*(\d+)$') { $watchMinDiscount = [int]$Matches[1] }
+                elseif ($seg -match '^type:\s*(.+)$') { $watchFlairs = @($Matches[1] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
             }
             # Build watch object and save to config.json
             $newWatch = [ordered]@{
@@ -556,6 +604,7 @@ function Try-ApplyDiscordControl {
             }
             if ($null -ne $watchMaxPrice) { $newWatch['max_price'] = $watchMaxPrice }
             if ($null -ne $watchMinDiscount) { $newWatch['min_discount_percent'] = $watchMinDiscount }
+            if ($watchFlairs.Count -gt 0) { $newWatch['flairs'] = $watchFlairs }
             # Read config, add watch, write back
             try {
                 $configRaw = Get-Content $ConfigPath -Raw | ConvertFrom-Json
@@ -571,10 +620,10 @@ function Try-ApplyDiscordControl {
                 Write-Log "[Discord Control] Added watch '$watchName': $($watchKeywords -join ', ')" -Level INFO
                 if (-not $applied) { $applied = [pscustomobject]@{} }
                 $applied | Add-Member -NotePropertyName 'watch_added' -NotePropertyValue $watchName -Force
-                $responseMessage = ":white_check_mark: Watch **$watchName** added (keywords: $($watchKeywords -join ', ')$(if ($watchMaxPrice) { ", max: `$$watchMaxPrice" })$(if ($watchMinDiscount) { ", discount: $watchMinDiscount%" }))"
+                $responseMessage = ":white_check_mark: Watch **$watchName** added (keywords: $($watchKeywords -join ', ')$(if ($watchMaxPrice) { ", max: `$$watchMaxPrice" })$(if ($watchMinDiscount) { ", discount: $watchMinDiscount%" })$(if ($watchFlairs.Count -gt 0) { ", type: $($watchFlairs -join ',')" }))"
             }
             catch {
-                Write-Log "[Discord Control] Failed to save watch: $_" -Level ERROR
+                Write-Log "[Discord Control] Failed to save watch: $($_.Exception.Message)" -Level ERROR
                 $responseMessage = ':x: Failed to save watch to config.'
             }
             continue
@@ -629,17 +678,107 @@ function Try-ApplyDiscordControl {
 
         if ($trim -match '^!keywords\s+set\s+(.+)$') {
             $raw = $Matches[1]
-            $parts = $raw -split ','
-            $newKeywords = @()
-            foreach ($p in $parts) {
-                $k = ($p -as [string]).Trim()
-                if ($k) { $newKeywords += $k }
-            }
+            $newKeywords = @($raw -split ',' | ForEach-Object { Normalize-Keyword $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
             if ($newKeywords.Count -gt 0) {
-                $newKeywords = @($newKeywords | Select-Object -Unique)
                 Set-Content -Path $KeywordsFilePath -Encoding UTF8 -Value ($newKeywords -join "`n")
                 $applied = [pscustomobject]@{ keywords = $newKeywords }
                 Write-Log "[Discord Control] Updated keywords.txt from command: $($newKeywords -join ', ')" -Level INFO
+                $responseMessage = ":white_check_mark: Keywords set: $($newKeywords -join ', ')"
+            }
+        }
+        elseif ($trim -match '^!keywords\s+add\s+(.+)$') {
+            $raw = $Matches[1]
+            $toAdd = @($raw -split ',' | ForEach-Object { Normalize-Keyword $_.Trim() } | Where-Object { $_ })
+            if ($toAdd.Count -gt 0) {
+                $existing = @(Load-KeywordsFromFile -Path $KeywordsFilePath)
+                $merged = @($existing + $toAdd | Select-Object -Unique)
+                $addedKws = @($toAdd | Where-Object { $existing -notcontains $_ })
+                Set-Content -Path $KeywordsFilePath -Encoding UTF8 -Value ($merged -join "`n")
+                Write-Log "[Discord Control] Added keywords: $($addedKws -join ', ')" -Level INFO
+                if ($addedKws.Count -gt 0) {
+                    $responseMessage = ":white_check_mark: Added: **$($addedKws -join ', ')**. All keywords: $($merged -join ', ')"
+                } else {
+                    $responseMessage = ":information_source: Keywords already present - no change. All: $($merged -join ', ')"
+                }
+                if (-not $applied) { $applied = [pscustomobject]@{} }
+                $applied | Add-Member -NotePropertyName 'keywords' -NotePropertyValue $merged -Force
+            }
+        }
+        elseif ($trim -match '^!keywords\s+remove\s+(.+)$') {
+            $raw = $Matches[1]
+            $toRemove = @($raw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($toRemove.Count -gt 0) {
+                $existing = @(Load-KeywordsFromFile -Path $KeywordsFilePath)
+                $remaining = @($existing | Where-Object { $toRemove -notcontains $_ })
+                $removedCount = $existing.Count - $remaining.Count
+                Set-Content -Path $KeywordsFilePath -Encoding UTF8 -Value ($remaining -join "`n")
+                Write-Log "[Discord Control] Removed $removedCount keyword(s)" -Level INFO
+                if ($removedCount -gt 0) {
+                    $remainText = if ($remaining.Count -gt 0) { $remaining -join ', ' } else { '(none)' }
+                    $responseMessage = ":white_check_mark: Removed $removedCount keyword(s). Remaining: $remainText"
+                } else {
+                    $existText = if ($existing.Count -gt 0) { $existing -join ', ' } else { '(none)' }
+                    $responseMessage = ":information_source: None of those keywords matched. Current: $existText"
+                }
+            }
+        }
+        if ($trim -match '^!(?:dealtype|flairs)') {
+            $responseMessage = ':information_source: Deal type filtering is now per-watch. Use `!watch add GPU | 5080 | max:1200 | type:GPU` to add a type filter to a watch.'
+            continue
+        }
+        elseif ($trim -match '^!history(?:\s+count)?$') {
+            $historyPath = Join-Path $ScriptPath 'history.json'
+            if (Test-Path $historyPath) {
+                try {
+                    $histContent = Get-Content $historyPath -Raw | ConvertFrom-Json
+                    $count = if ($histContent -is [array]) { $histContent.Count } else { 0 }
+                    $plural = if ($count -ne 1) { 's' } else { '' }
+                    $responseMessage = ":information_source: History: **$count** deal$plural tracked. Use ``!clearhistory`` to reset."
+                } catch { $responseMessage = ':x: Could not read history file.' }
+            } else {
+                $responseMessage = ':information_source: No history file found (0 tracked deals).'
+            }
+        }
+        elseif ($trim -match '^!scaninterval\s+(.+)$') {
+            $arg = $Matches[1].Trim()
+            if ($arg -ieq 'off') {
+                try {
+                    $configRaw = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+                    if ($configRaw.PSObject.Properties['scan_interval_minutes']) {
+                        $configRaw.PSObject.Properties.Remove('scan_interval_minutes')
+                    }
+                    $configRaw | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $ConfigPath
+                    $Config | Add-Member -NotePropertyName 'scan_interval_minutes' -NotePropertyValue $null -Force
+                    $responseMessage = ':white_check_mark: Auto-scan interval removed from config. Update Task Scheduler if needed.'
+                    Write-Log '[Discord Control] Removed scan_interval_minutes from config' -Level INFO
+                }
+                catch { $responseMessage = ':x: Failed to update config.' }
+            }
+            else {
+                # Parse: 2d | 1d 30 | 30
+                $parsedMins = 0
+                if ($arg -match '(\d+)\s*d') { $parsedMins += [int]$Matches[1] * 1440 }
+                $minPart = if ($arg -match 'd') { $arg -replace '^.*d\s*', '' } else { $arg }
+                if ($minPart -match '^\d+$') { $parsedMins += [int]$minPart }
+                if ($parsedMins -ge 1) {
+                    $newInterval = $parsedMins
+                    $fmtD = [math]::Floor($newInterval / 1440); $fmtM = $newInterval % 1440
+                    $fmtParts = @()
+                    if ($fmtD -gt 0) { $fmtParts += "$fmtD day$(if ($fmtD -ne 1) {'s'})" }
+                    if ($fmtM -gt 0) { $fmtParts += "$fmtM min" }
+                    $fmtStr = $fmtParts -join ' '
+                    try {
+                        $configRaw = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+                        $configRaw | Add-Member -NotePropertyName 'scan_interval_minutes' -NotePropertyValue $newInterval -Force
+                        $Config | Add-Member -NotePropertyName 'scan_interval_minutes' -NotePropertyValue $newInterval -Force
+                        $configRaw | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $ConfigPath
+                        $responseMessage = ":white_check_mark: Auto-scan set to every **$fmtStr** ($newInterval min) in config.json. Update Task Scheduler trigger to match."
+                        Write-Log "[Discord Control] Set scan_interval_minutes = $newInterval" -Level INFO
+                    }
+                    catch { $responseMessage = ':x: Failed to update config.' }
+                } else {
+                    $responseMessage = ':warning: Usage: `!scaninterval 30` / `!scaninterval 2d` / `!scaninterval 1d 30` / `!scaninterval off`'
+                }
             }
         }
         elseif ($trim -match '^!maxprice\s+(\d+(?:\.\d+)?)$') {
@@ -841,7 +980,7 @@ function Fetch-RedditJSON {
             $title = $data.title
             $description = if ($data.selftext) { $data.selftext } else { "" }
             $postUrl = if ($data.url) { $data.url } else { "https://reddit.com$($data.permalink)" }
-            $flair = if ($data.link_flair_text) { $data.link_flair_text } else { $null }
+            $flair = if ($data.link_flair_text) { [System.Net.WebUtility]::HtmlDecode([string]$data.link_flair_text) } else { $null }
             
             $deal = @{
                 Title = $title
@@ -1001,17 +1140,28 @@ function Fetch-JSONEndpoint {
 
 function Extract-PriceInfo {
     param([string]$Text)
-    
-    # Extract prices - looking for dollar amounts (with or without comma separators)
-    $pricePattern = '\$\s*(\d[\d,]*(?:\.\d{1,2})?)'
-    $matches = [regex]::Matches($Text, $pricePattern)
-    
+
     $prices = @()
-    foreach ($match in $matches) {
-        $priceValue = $match.Groups[1].Value -replace ',', ''
-        $prices += [decimal]$priceValue
+
+    # Pattern 1: Standard dollar-sign prices  e.g. $299, $1,299.99
+    foreach ($m in [regex]::Matches($Text, '\$\s*(\d[\d,]*(?:\.\d{1,2})?)')) {
+        $prices += [decimal]($m.Groups[1].Value -replace ',', '')
     }
-    
+
+    # Pattern 2: Hardwareswap-style prices without $ sign
+    # Only used when no $-prices found, to avoid double-counting.
+    # Requires a payment/shipping word after the number so model numbers
+    # like "5080" or "1440p" are never mistaken for prices.
+    # Matches: "800 shipped", "800 OBO", "800 or best offer",
+    #          "800 local", "800 firm", "800 PayPal", "800 Venmo",
+    #          "800 Zelle", "800 Cash"
+    if ($prices.Count -eq 0) {
+        $hwsPattern = '\b(\d[\d,]*(?:\.\d{1,2})?)\s*(?:shipped|obo|or\s+best\s+offer|local|firm|paypal|venmo|zelle|cash)\b'
+        foreach ($m in [regex]::Matches($Text, $hwsPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+            $prices += [decimal]($m.Groups[1].Value -replace ',', '')
+        }
+    }
+
     if ($prices.Count -eq 0) {
         return @{ CurrentPrice = $null; OriginalPrice = $null; DiscountPercent = $null }
     }
@@ -1019,10 +1169,10 @@ function Extract-PriceInfo {
         return @{ CurrentPrice = $prices[0]; OriginalPrice = $null; DiscountPercent = $null }
     }
     else {
-        # Assume format: "$299 (was $399)" or similar
+        # Assume format: "$299 (was $399)" or "800 shipped (was $1000)" etc.
         $currentPrice = $prices[0]
         $originalPrice = $prices[1]
-        
+
         if ($originalPrice -gt $currentPrice) {
             $discount = [math]::Round((($originalPrice - $currentPrice) / $originalPrice) * 100, 1)
             return @{ CurrentPrice = $currentPrice; OriginalPrice = $originalPrice; DiscountPercent = $discount }
@@ -1116,7 +1266,29 @@ function Filter-Deal {
     )
     
     $fullText = "$($Deal.Title) $($Deal.Description)"
-    
+
+    # Skip r/hardwareswap "Want to Buy" posts.
+    # On hardwareswap every post uses [H] = Have and [W] = Want.
+    # SELLING post: [H] <product>       [W] <payment method>
+    # WTB post:     [H] <payment method> [W] <product>
+    # We detect WTB by checking whether the content between [H] and [W]
+    # consists entirely of payment/location keywords (PayPal, Cash, Venmo,
+    # Zelle, Local, Verified, etc.) with no actual product words.
+    if ($Deal.Source -match 'hardwareswap') {
+        $hMatch = [regex]::Match($Deal.Title, '(?i)\[H\]\s*(.+?)\s*\[W\]')
+        if ($hMatch.Success) {
+            $hContent = $hMatch.Groups[1].Value.Trim()
+            # Strip out all payment/location tokens and punctuation
+            $stripped = $hContent -replace '(?i)\b(?:cash|paypal|venmo|zelle|local|verified|or|and|g&s|gs|f&f|ff)\b', ''
+            $stripped = $stripped -replace '[,/&+\s]', ''
+            # If nothing meaningful remains, the [H] section was payment-only → WTB post
+            if ($stripped.Length -eq 0) {
+                Write-Log "Skipping hardwareswap WTB post: $($Deal.Title)"
+                return $null
+            }
+        }
+    }
+
     # Extract price information once (shared by all watches)
     $priceInfo = Extract-PriceInfo -Text $fullText
     $extractedDiscount = Extract-DiscountPercent -Text $fullText
@@ -1144,9 +1316,23 @@ function Filter-Deal {
     foreach ($watch in $watches) {
         $watchKeywords = @($watch.keywords)
         if (($watchKeywords | Measure-Object).Count -eq 0) { continue }
-        
+
         $matchedKeywords = Test-KeywordMatch -Text $fullText -Keywords $watchKeywords
         if (($matchedKeywords | Measure-Object).Count -eq 0) { continue }
+
+        # Per-watch deal type filter (optional): check post flair if watch has 'flairs' defined
+        if ($watch.flairs -and ($watch.flairs | Measure-Object).Count -gt 0) {
+            $postFlair = [string]$Deal.Flair
+            $flairMatched = $false
+            foreach ($f in $watch.flairs) {
+                if ($postFlair -match [regex]::Escape([string]$f)) { $flairMatched = $true; break }
+            }
+            if (-not $flairMatched) {
+                $watchName2 = if ($watch.name) { $watch.name } else { 'unnamed' }
+                Write-Log "Deal skipped by watch '$watchName2': flair '$postFlair' not in [$($watch.flairs -join ', ')]"
+                continue
+            }
+        }
         
         # Per-watch price filter (falls back to global if not set)
         $watchMaxPrice = if ($null -ne $watch.max_price) { $watch.max_price } else { $Config.filters.max_price }
@@ -1409,25 +1595,12 @@ function Main {
         $history = @($history | ForEach-Object { [string]$_ })
     }
     
-    # Fetch deals from all sources
+    # Fetch deals from all sources (no global flair pre-filter — each watch handles its own type filter)
     $allDeals = @()
-    
-    # Resolve flair filter: CLI -Flairs > config filters.flairs > none
-    $flairFilter = @()
-    if ($PSBoundParameters.ContainsKey('Flairs') -and $Flairs -and $Flairs.Count -gt 0) {
-        $flairFilter = @($Flairs)
-        Write-Log "Flair filter (CLI): $($flairFilter -join ', ')"
-    }
-    elseif ($config.filters -and $config.filters.flairs) {
-        $flairFilter = @($config.filters.flairs)
-        Write-Log "Flair filter (config): $($flairFilter -join ', ')"
-    }
 
     foreach ($source in $config.sources) {
         if ($source.type -eq "reddit") {
-            # Per-source flair override, falling back to global
-            $sourceFlairs = if ($source.flairs) { @($source.flairs) } else { $flairFilter }
-            $deals = Fetch-RedditJSON -Subreddit $source.subreddit -Limit 25 -AllowedFlairs $sourceFlairs
+            $deals = Fetch-RedditJSON -Subreddit $source.subreddit -Limit 25
             $allDeals += $deals
         }
         elseif ($source.type -eq "slickdeals-web") {

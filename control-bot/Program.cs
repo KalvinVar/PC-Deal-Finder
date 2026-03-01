@@ -2,6 +2,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Discord;
 using Discord.WebSocket;
 
@@ -18,6 +19,7 @@ internal sealed class DealMonitorControlBot
 	private readonly bool _ack;
 	private readonly string _tokenEnv;
 	private int _scanRunning; // 0 = idle, 1 = running
+	private CancellationTokenSource? _autoScanCts;
 
 	public DealMonitorControlBot(string monitorDirectory, string configPath, string keywordsPath, ulong channelId, IEnumerable<ulong> allowedUserIds, bool ack, string tokenEnv)
 	{
@@ -43,6 +45,8 @@ internal sealed class DealMonitorControlBot
 		};
 
 		_client.MessageReceived += OnMessageReceivedAsync;
+		_client.Ready += RegisterSlashCommandsAsync;
+		_client.SlashCommandExecuted += OnSlashCommandExecutedAsync;
 	}
 
 	public async Task RunAsync(CancellationToken cancellationToken)
@@ -62,6 +66,13 @@ internal sealed class DealMonitorControlBot
 
 		await _client.LoginAsync(TokenType.Bot, token.Trim());
 		await _client.StartAsync();
+
+		var initialInterval = ReadScanIntervalMinutes();
+		if (initialInterval > 0)
+		{
+			StartAutoScanLoop(initialInterval);
+			Console.WriteLine($"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}] [INFO] Auto-scan loop started (every {initialInterval} min)");
+		}
 
 		try
 		{
@@ -121,6 +132,14 @@ internal sealed class DealMonitorControlBot
 			cmdText = "!" + cmdText["!dealmonitor ".Length..].TrimStart();
 		}
 
+		// Alias: !dealtype is the user-facing name for !flairs — now removed, show helpful redirect
+		if (cmdText.StartsWith("!dealtype", StringComparison.OrdinalIgnoreCase) ||
+		    cmdText.StartsWith("!flairs", StringComparison.OrdinalIgnoreCase))
+		{
+			await ReplyAsync(textChannel, ":information_source: Deal type filtering is now per-watch. Use `!watch add GPU | 5080 | max:1200 | type:GPU` to add a type filter to a watch.");
+			return;
+		}
+
 		if (cmdText.Equals("!help", StringComparison.OrdinalIgnoreCase) || cmdText.Equals("!keywords help", StringComparison.OrdinalIgnoreCase))
 		{
 			await ReplyAsync(textChannel, BuildHelp());
@@ -137,12 +156,24 @@ internal sealed class DealMonitorControlBot
 		if (cmdText.Equals("!status", StringComparison.OrdinalIgnoreCase))
 		{
 			var keywords = LoadKeywords();
-			var (maxPrice, minDiscount) = ReadFilters();
 			var watches = ReadWatches();
-			var watchPart = watches.Count > 0
-				? $" | watches={watches.Count} ({string.Join(", ", watches.Select(w => w.Name))})"
-				: "";
-			await ReplyAsync(textChannel, $":information_source: Status | keywords={(keywords.Count == 0 ? "(none)" : string.Join(", ", keywords))} | max_price={maxPrice} | min_discount_percent={minDiscount}{watchPart}");
+			var flairs = ReadFlairs();
+			var interval = ReadScanIntervalMinutes();
+			var histCount = 0;
+			try { var hp = Path.Combine(_monitorDirectory, "history.json"); if (File.Exists(hp) && JsonNode.Parse(File.ReadAllText(hp)) is JsonArray ha) histCount = ha.Count; } catch { }
+			var sb2 = new StringBuilder(":information_source: **Status**\n");
+			if (watches.Count > 0)
+				sb2.AppendLine($"**Watches:** {string.Join(" | ", watches.Select(w => $"{w.Name} [{string.Join(", ", w.Keywords)}]{(w.MaxPrice.HasValue ? $" max=${w.MaxPrice}" : "")}{(w.MinDiscount.HasValue ? $" discount={w.MinDiscount}%" : "")}"))}");
+			else
+				sb2.AppendLine("**Watches:** (none)");
+			var kwStr2 = keywords.Count == 0 ? "(none)" : string.Join(", ", keywords);
+			sb2.AppendLine(keywords.Count > 0 && watches.Count > 0
+				? $"**Keywords (keywords.txt):** {kwStr2} \u26a0\ufe0f ignored \u2014 watches take priority"
+				: $"**Keywords:** {kwStr2}");
+			sb2.AppendLine($"**Deal type filter:** {(flairs.Count == 0 ? "(all types)" : string.Join(", ", flairs))}");
+			sb2.AppendLine($"**History:** {histCount} deal{(histCount == 1 ? "" : "s")} seen");
+			sb2.AppendLine($"**Auto-scan:** {(interval > 0 ? $"every {FormatInterval(interval)}" : "off")}");
+			await ReplyAsync(textChannel, sb2.ToString());
 			return;
 		}
 
@@ -152,6 +183,8 @@ internal sealed class DealMonitorControlBot
 			var keywords = raw
 				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
 				.Where(k => !string.IsNullOrWhiteSpace(k))
+				.Select(NormalizeKeyword)
+				.Where(k => k.Length > 0)
 				.Distinct(StringComparer.OrdinalIgnoreCase)
 				.ToList();
 
@@ -165,6 +198,68 @@ internal sealed class DealMonitorControlBot
 			if (_ack)
 			{
 				await ReplyAsync(textChannel, $":white_check_mark: Updated keywords. Keywords: {string.Join(", ", keywords)}");
+			}
+			return;
+		}
+
+		if (cmdText.StartsWith("!keywords add ", StringComparison.OrdinalIgnoreCase))
+		{
+			var raw = cmdText["!keywords add ".Length..];
+			var toAdd = raw
+				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+				.Where(k => !string.IsNullOrWhiteSpace(k))
+				.Select(NormalizeKeyword)
+				.Where(k => k.Length > 0)
+				.Distinct(StringComparer.OrdinalIgnoreCase)
+				.ToList();
+
+			if (toAdd.Count == 0)
+			{
+				await ReplyAsync(textChannel, ":warning: No keywords provided. Example: `!keywords add RTX 5070, 4K monitor`");
+				return;
+			}
+
+			var existing = LoadKeywords();
+			var merged = existing.Concat(toAdd).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+			var added = toAdd.Where(k => !existing.Any(e => string.Equals(e, k, StringComparison.OrdinalIgnoreCase))).ToList();
+			SaveKeywords(merged);
+			if (_ack)
+			{
+				var msg = added.Count > 0
+					? $":white_check_mark: Added: **{string.Join(", ", added)}**. All keywords: {string.Join(", ", merged)}"
+					: $":information_source: Keywords already present — no change. All: {string.Join(", ", merged)}";
+				await ReplyAsync(textChannel, msg);
+			}
+			return;
+		}
+
+		if (cmdText.StartsWith("!keywords remove ", StringComparison.OrdinalIgnoreCase))
+		{
+			var raw = cmdText["!keywords remove ".Length..];
+			var toRemove = raw
+				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+				.Where(k => !string.IsNullOrWhiteSpace(k))
+				.Distinct(StringComparer.OrdinalIgnoreCase)
+				.ToList();
+
+			if (toRemove.Count == 0)
+			{
+				await ReplyAsync(textChannel, ":warning: Specify keyword(s) to remove. Example: `!keywords remove DDR5, RAM`");
+				return;
+			}
+
+			var existing = LoadKeywords();
+			var remaining = existing
+				.Where(k => !toRemove.Any(r => string.Equals(r, k, StringComparison.OrdinalIgnoreCase)))
+				.ToList();
+			var removedCount = existing.Count - remaining.Count;
+			SaveKeywords(remaining);
+			if (_ack)
+			{
+				var msg = removedCount > 0
+					? $":white_check_mark: Removed {removedCount} keyword{(removedCount == 1 ? "" : "s")}. Remaining: {(remaining.Count == 0 ? "(none)" : string.Join(", ", remaining))}"
+					: $":information_source: None of those keywords matched. Current: {(existing.Count == 0 ? "(none)" : string.Join(", ", existing))}";
+				await ReplyAsync(textChannel, msg);
 			}
 			return;
 		}
@@ -200,6 +295,55 @@ internal sealed class DealMonitorControlBot
 			{
 				await ReplyAsync(textChannel, $":white_check_mark: Updated filter. min_discount_percent={minDiscount}");
 			}
+			return;
+		}
+
+		if (cmdText.Equals("!flairs show", StringComparison.OrdinalIgnoreCase))
+		{
+			var flairs = ReadFlairs();
+			await ReplyAsync(textChannel, $":information_source: Category filter: {(flairs.Count == 0 ? "(none — all categories accepted)" : string.Join(", ", flairs))}");
+			return;
+		}
+
+		if (cmdText.StartsWith("!flairs set ", StringComparison.OrdinalIgnoreCase))
+		{
+			var raw = cmdText["!flairs set ".Length..];
+			var flairs = raw
+				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+				.Where(f => !string.IsNullOrWhiteSpace(f))
+				.Distinct(StringComparer.OrdinalIgnoreCase)
+				.ToList();
+			WriteFlairs(flairs.Count > 0 ? flairs : null);
+			if (_ack)
+				await ReplyAsync(textChannel, $":white_check_mark: Category filter set to: {(flairs.Count == 0 ? "(all accepted)" : string.Join(", ", flairs))}");
+			return;
+		}
+
+		if (cmdText.StartsWith("!flairs add ", StringComparison.OrdinalIgnoreCase))
+		{
+			var raw = cmdText["!flairs add ".Length..];
+			var toAdd = raw
+				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+				.Where(f => !string.IsNullOrWhiteSpace(f))
+				.ToList();
+			if (toAdd.Count == 0)
+			{
+				await ReplyAsync(textChannel, ":warning: No categories provided. Example: `!flairs add SSD, Monitor`");
+				return;
+			}
+			var existing = ReadFlairs();
+			var merged = existing.Concat(toAdd).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+			WriteFlairs(merged);
+			if (_ack)
+				await ReplyAsync(textChannel, $":white_check_mark: Category filter updated: {string.Join(", ", merged)}");
+			return;
+		}
+
+		if (cmdText.Equals("!flairs clear", StringComparison.OrdinalIgnoreCase))
+		{
+			WriteFlairs(null);
+			if (_ack)
+				await ReplyAsync(textChannel, ":white_check_mark: Category filter cleared — all post categories will be accepted.");
 			return;
 		}
 
@@ -244,6 +388,8 @@ internal sealed class DealMonitorControlBot
 			var watchKeywords = parts[1]
 				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
 				.Where(k => !string.IsNullOrWhiteSpace(k))
+				.Select(NormalizeKeyword)
+				.Where(k => k.Length > 0)
 				.ToList();
 			if (string.IsNullOrWhiteSpace(watchName) || watchKeywords.Count == 0)
 			{
@@ -300,6 +446,353 @@ internal sealed class DealMonitorControlBot
 			await HandleClearHistoryAsync(textChannel);
 			return;
 		}
+
+		if (cmdText.Equals("!history count", StringComparison.OrdinalIgnoreCase) ||
+		    cmdText.Equals("!history", StringComparison.OrdinalIgnoreCase))
+		{
+			var histPath = Path.Combine(_monitorDirectory, "history.json");
+			try
+			{
+				if (!File.Exists(histPath))
+				{
+					await ReplyAsync(textChannel, ":information_source: No history file found (0 tracked deals).");
+					return;
+				}
+				var histContent = File.ReadAllText(histPath);
+				var count = JsonNode.Parse(histContent) is JsonArray arr ? arr.Count : 0;
+				await ReplyAsync(textChannel, $":information_source: History: **{count}** deal{(count == 1 ? "" : "s")} tracked. Use `!clearhistory` to reset.");
+			}
+			catch (Exception ex)
+			{
+				await ReplyAsync(textChannel, $":x: Could not read history: {ex.Message}");
+			}
+			return;
+		}
+
+		if (cmdText.StartsWith("!scaninterval", StringComparison.OrdinalIgnoreCase))
+		{
+			var arg = cmdText["!scaninterval".Length..].Trim();
+			if (arg.Equals("off", StringComparison.OrdinalIgnoreCase))
+			{
+				StopAutoScanLoop();
+				WriteScanIntervalMinutes(null);
+				if (_ack)
+					await ReplyAsync(textChannel, ":white_check_mark: Auto-scan disabled. Use `!scan` to scan manually.");
+				return;
+			}
+			if (!int.TryParse(arg, out var intervalMin) || intervalMin < 1)
+			{
+				var current = ReadScanIntervalMinutes();
+				var currentStr = current > 0 ? $"currently {current} min" : "currently off";
+				await ReplyAsync(textChannel, $":warning: Usage: `!scaninterval 30` (minutes ≥ 1) or `!scaninterval off`. {currentStr}.");
+				return;
+			}
+			WriteScanIntervalMinutes(intervalMin);
+			StartAutoScanLoop(intervalMin);
+			if (_ack)
+				await ReplyAsync(textChannel, $":white_check_mark: Auto-scan set to every **{intervalMin} minute{(intervalMin == 1 ? "" : "s")}**. Next scan in ~{intervalMin} min.");
+			return;
+		}
+	}
+
+	private async Task RegisterSlashCommandsAsync()
+	{
+		try
+		{
+			var channel = _client.GetChannel(_channelId) as SocketGuildChannel;
+			var guild = channel?.Guild;
+			if (guild is null)
+			{
+				Console.WriteLine($"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}] [WARNING] Cannot register slash commands: channel {_channelId} not found or not a guild channel.");
+				return;
+			}
+
+			var commands = new List<Discord.ApplicationCommandProperties>
+			{
+				new SlashCommandBuilder()
+					.WithName("watch")
+					.WithDescription("Watch groups — monitor products with their own keywords, price limit, and optional deal type")
+					.AddOption(new SlashCommandOptionBuilder()
+						.WithName("list").WithDescription("Show all watch groups and their filters")
+						.WithType(ApplicationCommandOptionType.SubCommand))
+					.AddOption(new SlashCommandOptionBuilder()
+						.WithName("add").WithDescription("Create or update a watch group")
+						.WithType(ApplicationCommandOptionType.SubCommand)
+						.AddOption("name", ApplicationCommandOptionType.String, "Label for this group, e.g. GPU or SSD", isRequired: true)
+						.AddOption("keywords", ApplicationCommandOptionType.String, "Words to match, e.g. RTX 5080, 5070 Ti", isRequired: true)
+						.AddOption("maxprice", ApplicationCommandOptionType.Number, "Only notify at or below this price, e.g. 800", isRequired: false)
+						.AddOption("discount", ApplicationCommandOptionType.Integer, "Minimum discount %, e.g. 10", isRequired: false)
+						.AddOption("type", ApplicationCommandOptionType.String, "Only match posts with this Reddit flair, e.g. GPU or Monitor", isRequired: false))
+					.AddOption(new SlashCommandOptionBuilder()
+						.WithName("remove").WithDescription("Delete a watch group by its name")
+						.WithType(ApplicationCommandOptionType.SubCommand)
+						.AddOption("name", ApplicationCommandOptionType.String, "Name of the group to delete", isRequired: true))
+					.AddOption(new SlashCommandOptionBuilder()
+						.WithName("clear").WithDescription("Delete all watch groups at once")
+						.WithType(ApplicationCommandOptionType.SubCommand))
+					.Build(),
+
+				new SlashCommandBuilder()
+					.WithName("scan")
+					.WithDescription("Check for new deals right now instead of waiting for the next scheduled run")
+					.Build(),
+
+				new SlashCommandBuilder()
+					.WithName("scaninterval")
+					.WithDescription("Auto-scan every N days/minutes (bot must stay running). Use 'off' to disable.")
+					.AddOption("days", ApplicationCommandOptionType.Integer, "Number of days between scans (e.g. 1)", isRequired: false)
+					.AddOption("minutes", ApplicationCommandOptionType.Integer, "Additional minutes on top of days (e.g. 30)", isRequired: false)
+					.AddOption("off", ApplicationCommandOptionType.Boolean, "Set to True to disable auto-scanning", isRequired: false)
+					.Build(),
+
+				new SlashCommandBuilder()
+					.WithName("clearhistory")
+					.WithDescription("Forget all previously seen deals so they can be re-sent on the next scan")
+					.Build(),
+
+				new SlashCommandBuilder()
+					.WithName("status")
+					.WithDescription("Show a summary of all current settings: keywords, filters, watches, and scan interval")
+					.Build(),
+
+				new SlashCommandBuilder()
+					.WithName("ping")
+					.WithDescription("Check that the bot is online and responding")
+					.Build(),
+			};
+
+			await guild.BulkOverwriteApplicationCommandAsync(commands.ToArray());
+			Console.WriteLine($"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}] [INFO] Registered {commands.Count} slash command(s) to guild '{guild.Name}'.");
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}] [ERROR] Failed to register slash commands: {ex.Message}");
+		}
+	}
+
+	private async Task OnSlashCommandExecutedAsync(SocketSlashCommand command)
+	{
+		// Only handle commands in the designated control channel
+		if (command.Channel.Id != _channelId)
+			return;
+
+		// Enforce allowed-user allowlist
+		if (_allowedUserIds.Count > 0 && !_allowedUserIds.Contains(command.User.Id))
+		{
+			await command.RespondAsync(":no_entry: You are not authorized to use this command.", ephemeral: true);
+			return;
+		}
+
+		var name = command.CommandName;
+		// First-level option is either the value (top-level command) or a subcommand
+		var first = command.Data.Options.FirstOrDefault();
+		var subName = first?.Type == ApplicationCommandOptionType.SubCommand ? first.Name : "";
+
+		string reply;
+		switch (name)
+		{
+			case "ping":
+				await command.RespondAsync(":information_source: pong");
+				return;
+
+			case "status":
+			{
+				var keywords = LoadKeywords();
+				var watches = ReadWatches();
+				var flairs = ReadFlairs();
+				var interval = ReadScanIntervalMinutes();
+				var histCount = 0;
+				try { var hp = Path.Combine(_monitorDirectory, "history.json"); if (File.Exists(hp) && JsonNode.Parse(File.ReadAllText(hp)) is JsonArray ha) histCount = ha.Count; } catch { }
+				var sbS = new StringBuilder(":information_source: **Status**\n");
+				if (watches.Count > 0)
+				{
+					sbS.AppendLine($"**Watches:**");
+					foreach (var w in watches)
+					{
+						var maxStr = w.MaxPrice.HasValue ? $" max=${w.MaxPrice}" : "";
+						var discStr = w.MinDiscount.HasValue ? $" discount={w.MinDiscount}%" : "";
+						var typeStr = w.Flairs.Count > 0 ? $" type={string.Join(",", w.Flairs)}" : "";
+						sbS.AppendLine($"  {w.Name} [{string.Join(", ", w.Keywords)}]{maxStr}{discStr}{typeStr}");
+					}
+				}
+				else
+					sbS.AppendLine("**Watches:** (none)");
+				var kwStrS = keywords.Count == 0 ? "(none)" : string.Join(", ", keywords);
+			sbS.AppendLine(keywords.Count > 0 && watches.Count > 0
+				? $"**Keywords (keywords.txt):** {kwStrS} \u26a0\ufe0f ignored \u2014 watches take priority"
+				: $"**Keywords:** {kwStrS}");
+			sbS.AppendLine($"**History:** {histCount} deal{(histCount == 1 ? "" : "s")} seen");
+			sbS.AppendLine($"**Auto-scan:** {(interval > 0 ? $"every {FormatInterval(interval)}" : "off")}");
+				reply = sbS.ToString();
+				if (reply.Length > 1900) reply = reply[..1900] + "...";
+				await command.RespondAsync(reply);
+				return;
+			}
+
+
+
+			case "clearhistory":
+			{
+				try
+				{
+					var histPath = Path.Combine(_monitorDirectory, "history.json");
+					var count = File.Exists(histPath) && JsonNode.Parse(File.ReadAllText(histPath)) is JsonArray arr ? arr.Count : 0;
+					WriteAtomic(histPath, "[]");
+					await command.RespondAsync($":white_check_mark: History cleared ({count} deal{(count == 1 ? "" : "s")} removed). All deals will be treated as new on the next scan.");
+				}
+				catch (Exception ex) { await command.RespondAsync($":x: Failed to clear history: {ex.Message}"); }
+				return;
+			}
+
+
+
+			case "scaninterval":
+			{
+				var val = ((string)(first?.Value ?? "")).Trim();
+				if (val.Equals("off", StringComparison.OrdinalIgnoreCase))
+				{
+					StopAutoScanLoop();
+					WriteScanIntervalMinutes(null);
+					await command.RespondAsync(":white_check_mark: Auto-scan disabled. Use `/scan` to scan manually.");
+					return;
+				}
+				if (!int.TryParse(val, out var mins) || mins < 1)
+				{
+					var cur = ReadScanIntervalMinutes();
+					await command.RespondAsync($":warning: Provide a number ≥ 1 or `off`. Currently: {(cur > 0 ? $"{cur} min" : "off")}.");
+					return;
+				}
+				WriteScanIntervalMinutes(mins);
+				StartAutoScanLoop(mins);
+				await command.RespondAsync($":white_check_mark: Auto-scan every **{mins} minute{(mins == 1 ? "" : "s")}**. Next scan in ~{mins} min.");
+				return;
+			}
+
+			// /scan uses DeferAsync because the PS process can take >3 seconds
+			case "scan":
+			{
+				if (Interlocked.CompareExchange(ref _scanRunning, 1, 0) != 0)
+				{
+					await command.RespondAsync(":hourglass: A scan is already running. Please wait.");
+					return;
+				}
+				await command.DeferAsync(); // acknowledge within 3 s; result comes via FollowupAsync
+				try
+				{
+					var scriptPath = Path.Combine(_monitorDirectory, "deal-monitor.ps1");
+					if (!File.Exists(scriptPath)) { await command.FollowupAsync(":x: deal-monitor.ps1 not found."); return; }
+
+					var psi = new ProcessStartInfo
+					{
+						FileName = "powershell.exe",
+						Arguments = $"-ExecutionPolicy Bypass -NoProfile -File \"{scriptPath}\" -SkipDiscordControl",
+						WorkingDirectory = _monitorDirectory,
+						RedirectStandardOutput = true,
+						RedirectStandardError = true,
+						UseShellExecute = false,
+						CreateNoWindow = true
+					};
+					var stdout = new StringBuilder();
+					var stderr = new StringBuilder();
+					using var process = new Process { StartInfo = psi };
+					process.OutputDataReceived += (_, e) => { if (e.Data != null) stdout.AppendLine(e.Data); };
+					process.ErrorDataReceived += (_, e) => { if (e.Data != null) stderr.AppendLine(e.Data); };
+					process.Start();
+					process.BeginOutputReadLine();
+					process.BeginErrorReadLine();
+					var exited = await Task.Run(() => process.WaitForExit(60_000));
+					if (!exited) { try { process.Kill(); } catch { } await command.FollowupAsync(":x: Scan timed out after 60 seconds."); return; }
+
+					var lines = stdout.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+					var sent = lines.FirstOrDefault(l => l.Contains("[SUCCESS] Sent:"));
+					var filtered = lines.FirstOrDefault(l => l.Contains("Filtered deals (new):"));
+					var total = lines.FirstOrDefault(l => l.Contains("Total deals fetched:"));
+					var successLines = lines.Where(l => l.Contains("[SUCCESS] Discord notification sent:")).ToList();
+					var sb = new StringBuilder();
+					if (process.ExitCode == 0)
+					{
+						sb.AppendLine(":white_check_mark: **Scan complete!**");
+						if (total != null) sb.AppendLine($"Deals scanned: {ExtractNumber(total)}");
+						if (filtered != null) sb.AppendLine($"Matched: {ExtractNumber(filtered)}");
+						if (sent != null) sb.AppendLine($"Notifications sent: {ExtractNumber(sent)}");
+						if (successLines.Count > 0) { sb.AppendLine("**Deals found:**"); foreach (var dl in successLines.Take(10)) { var idx = dl.IndexOf("sent:", StringComparison.Ordinal); sb.AppendLine($"- {(idx >= 0 ? dl[(idx + 5)..].Trim() : dl.Trim())}"); } }
+						else sb.AppendLine("No new deals found this scan.");
+					}
+					else
+					{
+						sb.AppendLine($":x: Scan failed (exit code {process.ExitCode})");
+						var errOut = stderr.ToString().Trim();
+						if (!string.IsNullOrEmpty(errOut)) sb.AppendLine($"```{errOut[..Math.Min(errOut.Length, 500)]}```");
+					}
+					var result = sb.ToString();
+					if (result.Length > 1900) result = result[..1900] + "...";
+					await command.FollowupAsync(result);
+				}
+				finally { Interlocked.Exchange(ref _scanRunning, 0); }
+				return;
+			}
+
+
+
+			case "watch":
+			{
+				var subOpts = first?.Options ?? Enumerable.Empty<SocketSlashCommandDataOption>();
+				switch (subName)
+				{
+					case "list":
+					{
+						var watches = ReadWatches();
+						if (watches.Count == 0) { await command.RespondAsync(":information_source: No watches configured."); return; }
+						var sb = new StringBuilder(":information_source: **Active watches:**\n");
+						foreach (var w in watches)
+						{
+							var maxP = w.MaxPrice.HasValue ? w.MaxPrice.Value.ToString() : "any";
+							var minD = w.MinDiscount.HasValue ? $"{w.MinDiscount.Value}%" : "any";
+							sb.AppendLine($"- **{w.Name}**: [{string.Join(", ", w.Keywords)}] max={maxP} discount={minD}");
+						}
+						reply = sb.ToString();
+						if (reply.Length > 1900) reply = reply[..1900] + "...";
+						await command.RespondAsync(reply);
+						return;
+					}
+					case "add":
+					{
+						var opts = subOpts.ToDictionary(o => o.Name);
+						var wName = NormalizeKeyword((string)(opts["name"].Value ?? ""));
+						var kwRaw = (string)(opts["keywords"].Value ?? "");
+						var kws = kwRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+							.Select(NormalizeKeyword).Where(k => k.Length > 0).ToList();
+						if (string.IsNullOrWhiteSpace(wName) || kws.Count == 0) { await command.RespondAsync(":warning: Need a name and at least one keyword."); return; }
+						double? mp = opts.TryGetValue("maxprice", out var mpOpt) ? Convert.ToDouble(mpOpt.Value) : null;
+						int? md = opts.TryGetValue("discount", out var mdOpt) ? Convert.ToInt32(mdOpt.Value) : null;
+						var wfl = opts.TryGetValue("type", out var typeOpt)
+							? ((string)(typeOpt.Value ?? "")).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
+							: new List<string>();
+						AddOrUpdateWatch(wName, kws, mp, md, wfl.Count > 0 ? wfl : null);
+						var extras = (mp.HasValue ? $", max: ${mp}" : "") + (md.HasValue ? $", discount: {md}%" : "") + (wfl.Count > 0 ? $", type: {string.Join(",", wfl)}" : "");
+						await command.RespondAsync($":white_check_mark: Watch **{wName}** saved (keywords: {string.Join(", ", kws)}{extras}).");
+						return;
+					}
+					case "remove":
+					{
+						var wName = (string)(subOpts.First().Value ?? "");
+						var (removed, remaining) = RemoveWatch(wName);
+						await command.RespondAsync(removed
+							? $":white_check_mark: Watch **{wName}** removed. {remaining} watch(es) remaining."
+							: $":warning: Watch '{wName}' not found.");
+						return;
+					}
+					case "clear":
+						ClearWatches();
+						await command.RespondAsync(":white_check_mark: All watches cleared.");
+						return;
+				}
+				break;
+			}
+
+		}
+
+		await command.RespondAsync(":warning: Unknown or malformed command.", ephemeral: true);
 	}
 
 	private async Task HandleClearHistoryAsync(ISocketMessageChannel channel)
@@ -452,35 +945,58 @@ internal sealed class DealMonitorControlBot
 		{
 			":information_source: **Deal Monitor Bot — Command Reference**",
 			"",
-			"__**Keywords (simple mode)**__",
-			"`!keywords set kw1, kw2, kw3` — Replace all keywords (comma-separated)",
-			"`!keywords show` — Show current keywords from keywords.txt",
+			"__**Keywords**__ — words the bot looks for in deal titles",
+			"`!keywords set kw1, kw2` — replace the entire list",
+			"`!keywords add kw1, kw2` — add to the existing list",
+			"`!keywords remove kw1` — remove a specific word",
+			"`!keywords show` — see what the bot is currently watching",
 			"",
-			"__**Watches (multi-search with per-group filters)**__",
-			"`!watch add Name | kw1, kw2 | max:500 | discount:15`",
-			"  ↳ Create/update a watch group. `max` and `discount` are optional.",
-			"  ↳ Example: `!watch add GPU | 5080, 5070 ti | max:1200`",
-			"`!watch list` — Show all active watches with their filters",
-			"`!watch remove Name` — Delete a watch by name",
-			"`!watch clear` — Remove all watches",
+			"__**Watches**__ — separate keyword groups each with their own price limit",
+			"`!watch add GPU | RTX 5080, 5070 Ti | max:1200 | discount:10`",
+			"`!watch list` — see all watch groups",
+			"`!watch remove GPU` — delete a watch group",
+			"`!watch clear` — delete all watch groups",
 			"",
-			"__**Global filters**__ (apply when no watch matches)",
-			"`!maxprice 200` — Only notify for deals under this price",
-			"`!mindiscount 15` — Only notify if discount ≥ this %",
+			"__**Filters**__ — global limits applied when no watch group matches",
+			"`!maxprice 200` — skip deals over this price",
+			"`!mindiscount 15` — skip deals with less than this % off",
+			"`!flairs set GPU, SSD` — only notify for these deal categories",
+			"`!flairs add Monitor` — add a category to the filter",
+			"`!flairs show` — see active category filters",
+			"`!flairs clear` — notify for all categories again",
 			"",
-			"__**On-demand**__",
-			"`!scan` — Run the deal monitor right now (no waiting for schedule)",
-			"`!clearhistory` — Reset seen-deals history so all deals re-send",
-			"`!status` — Show current config (keywords, watches, filters)",
-			"`!ping` — Check if bot is alive",
+			"__**Scanning**__",
+			"`!scan` — check for deals right now",
+			"`!scaninterval 2d` / `!scaninterval 30` / `!scaninterval 1d 30` — auto-scan interval",
+			"`!scaninterval off` — stop auto-scanning",
 			"",
-			"__**Notes**__",
-			"• Keywords are **case-insensitive** (e.g., `1440p` matches `1440P`)",
-			"• Watches take priority over simple keywords when both are set",
-			"• Each watch has independent price/discount filters",
-			"• `!scan` won't send duplicates — already-seen deals are skipped",
-			"• Use `!clearhistory` + `!scan` to force re-check all deals"
+			"__**History & Status**__",
+			"`!history` — how many deals have been seen",
+			"`!clearhistory` — forget seen deals so they can re-send",
+			"`!status` — see a full summary of all current settings",
+			"`!ping` — check if the bot is online",
+			"",
+			"**Tips**",
+			"• Keywords are case-insensitive — `RTX` and `rtx` both work",
+			"• Extra spaces and leading zeros are auto-cleaned (e.g. `050W` → `50W`)",
+			"• Watch groups take priority over simple keywords when both are set",
+			"• `!scan` won't re-send deals already in history",
+			"• Use `!clearhistory` then `!scan` to force a full re-check"
 		});
+	}
+
+	/// <summary>
+	/// Normalizes a keyword: collapses whitespace and strips leading zeros from
+	/// embedded numbers so that e.g. "050W" becomes "50W" and "01440p" becomes "1440p".
+	/// This prevents accidental mismatches caused by formatting differences.
+	/// </summary>
+	private static string NormalizeKeyword(string kw)
+	{
+		// 1. Trim and collapse internal whitespace
+		kw = Regex.Replace(kw.Trim(), @"\s+", " ");
+		// 2. Strip leading zeros from numbers embedded in text (e.g. "050W" → "50W")
+		kw = Regex.Replace(kw, @"\b0+(\d)", "$1");
+		return kw;
 	}
 
 	private List<string> LoadKeywords()
@@ -529,9 +1045,116 @@ internal sealed class DealMonitorControlBot
 		}
 	}
 
+	private List<string> ReadFlairs()
+	{
+		try
+		{
+			var root = JsonNode.Parse(File.ReadAllText(_configPath)) as JsonObject;
+			var filters = root?["filters"] as JsonObject;
+			if (filters?["flairs"] is JsonArray arr)
+				return arr
+					.Select(n => n?.GetValue<string>() ?? "")
+					.Where(s => !string.IsNullOrWhiteSpace(s))
+					.ToList();
+			return new();
+		}
+		catch { return new(); }
+	}
+
+	private void WriteFlairs(List<string>? flairs)
+	{
+		var root = (JsonNode.Parse(File.ReadAllText(_configPath)) as JsonObject) ?? new JsonObject();
+		var filters = root["filters"] as JsonObject;
+		if (filters is null)
+		{
+			filters = new JsonObject();
+			root["filters"] = filters;
+		}
+		if (flairs == null || flairs.Count == 0)
+			filters["flairs"] = null;
+		else
+			filters["flairs"] = new JsonArray(flairs.Select(f => JsonValue.Create(f)).ToArray<JsonNode>());
+		var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+		WriteAtomic(_configPath, json);
+	}
+
+	private static string FormatInterval(int totalMinutes)
+	{
+		if (totalMinutes <= 0) return "off";
+		var d = totalMinutes / 1440;
+		var m = totalMinutes % 1440;
+		if (d > 0 && m > 0) return $"{d} day{(d == 1 ? "" : "s")} {m} min";
+		if (d > 0) return $"{d} day{(d == 1 ? "" : "s")}";
+		return $"{m} min";
+	}
+
+	private int ReadScanIntervalMinutes()
+	{
+		try
+		{
+			var root = JsonNode.Parse(File.ReadAllText(_configPath)) as JsonObject;
+			if (root?["scan_interval_minutes"] is JsonNode n)
+			{
+				var v = n.GetValue<int>();
+				if (v > 0) return v;
+			}
+			return 0;
+		}
+		catch { return 0; }
+	}
+
+	private void WriteScanIntervalMinutes(int? minutes)
+	{
+		var root = (JsonNode.Parse(File.ReadAllText(_configPath)) as JsonObject) ?? new JsonObject();
+		if (minutes.HasValue && minutes.Value > 0)
+			root["scan_interval_minutes"] = minutes.Value;
+		else
+			root.Remove("scan_interval_minutes");
+		var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+		WriteAtomic(_configPath, json);
+	}
+
+	private void StartAutoScanLoop(int minutes)
+	{
+		// Cancel any existing loop
+		_autoScanCts?.Cancel();
+		_autoScanCts = new CancellationTokenSource();
+		var token = _autoScanCts.Token;
+
+		_ = Task.Run(async () =>
+		{
+			while (!token.IsCancellationRequested)
+			{
+				try
+				{
+					await Task.Delay(TimeSpan.FromMinutes(minutes), token);
+				}
+				catch (OperationCanceledException)
+				{
+					break;
+				}
+
+				if (token.IsCancellationRequested)
+					break;
+
+				if (_client.GetChannel(_channelId) is ISocketMessageChannel chan)
+				{
+					Console.WriteLine($"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}] [INFO] Auto-scan triggered (interval: {minutes} min)");
+					await HandleScanAsync(chan);
+				}
+			}
+		}, CancellationToken.None);
+	}
+
+	private void StopAutoScanLoop()
+	{
+		_autoScanCts?.Cancel();
+		_autoScanCts = null;
+	}
+
 	// ---- Watch helpers ----
 
-	private record WatchInfo(string Name, List<string> Keywords, double? MaxPrice, int? MinDiscount);
+	private record WatchInfo(string Name, List<string> Keywords, double? MaxPrice, int? MinDiscount, List<string> Flairs);
 
 	private List<WatchInfo> ReadWatches()
 	{
@@ -551,14 +1174,19 @@ internal sealed class DealMonitorControlBot
 							kws.Add(s);
 				double? mp = obj["max_price"] is JsonNode mpn ? mpn.GetValue<double>() : null;
 				int? md = obj["min_discount_percent"] is JsonNode mdn ? mdn.GetValue<int>() : null;
-				result.Add(new WatchInfo(name, kws, mp, md));
+				var flairs = new List<string>();
+				if (obj["flairs"] is JsonArray fArr)
+					foreach (var f in fArr)
+						if (f?.GetValue<string>() is string fs && !string.IsNullOrWhiteSpace(fs))
+							flairs.Add(fs);
+				result.Add(new WatchInfo(name, kws, mp, md, flairs));
 			}
 			return result;
 		}
 		catch { return new(); }
 	}
 
-	private void AddOrUpdateWatch(string name, List<string> keywords, double? maxPrice, int? minDiscount)
+	private void AddOrUpdateWatch(string name, List<string> keywords, double? maxPrice, int? minDiscount, List<string>? flairs = null)
 	{
 		var root = (JsonNode.Parse(File.ReadAllText(_configPath)) as JsonObject) ?? new JsonObject();
 		if (root["watches"] is not JsonArray watches)
@@ -580,6 +1208,8 @@ internal sealed class DealMonitorControlBot
 		};
 		if (maxPrice.HasValue) newWatch["max_price"] = maxPrice.Value;
 		if (minDiscount.HasValue) newWatch["min_discount_percent"] = minDiscount.Value;
+		if (flairs != null && flairs.Count > 0)
+			newWatch["flairs"] = new JsonArray(flairs.Select(f => JsonValue.Create(f)).ToArray<JsonNode>());
 		watches.Add(newWatch);
 		var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
 		WriteAtomic(_configPath, json);
@@ -735,3 +1365,4 @@ internal static class Program
 		await bot.RunAsync(cts.Token);
 	}
 }
+
